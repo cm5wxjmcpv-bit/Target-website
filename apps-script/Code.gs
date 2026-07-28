@@ -150,11 +150,11 @@ function setupSystem() {
 
 function rebuildMonthlySummary() {
   if (!isInitialized_()) {
-    SpreadsheetApp.getUi().alert("Run Setup / Repair System first.");
+    notifyUser_("Run Setup / Repair System first.");
     return;
   }
   rebuildMonthlySummary_();
-  SpreadsheetApp.getUi().alert("Monthly summary rebuilt.");
+  notifyUser_("Monthly summary rebuilt.");
 }
 
 function doGet() {
@@ -305,7 +305,7 @@ function setupSystem_(showAlert) {
     const note = createdDefaultAdmin
       ? "Setup complete.\n\nInitial login:\nUsername: admin\nPassword: ChangeMe123!\n\nChange the password on the Users tab before sharing the site."
       : "Setup/repair complete. Existing data and users were preserved.";
-    SpreadsheetApp.getUi().alert(note);
+    notifyUser_(note);
   }
 
   return { createdDefaultAdmin: createdDefaultAdmin };
@@ -1195,6 +1195,14 @@ function formatTimestamp_(value) {
     return Utilities.formatDate(value, TARGET_DASHBOARD.timezone, "MMM d, yyyy h:mm a");
   }
   return String(value || "");
+}
+
+function notifyUser_(message) {
+  try {
+    SpreadsheetApp.getUi().alert(String(message || ""));
+  } catch (error) {
+    console.log(String(message || ""));
+  }
 }
 
 function jsonResponse_(payload) {
