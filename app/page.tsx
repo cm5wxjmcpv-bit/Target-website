@@ -214,11 +214,10 @@ function formatNumber(value: number) {
 }
 
 function formatHours(value: number) {
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value || 0);
-}
-
-function documentedHourLabel(value: number) {
-  return `${formatHours(value)} documented ${value === 1 ? "hour" : "hours"}`;
+  return new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value || 0);
 }
 
 function parseCsv(text: string): string[][] {
@@ -967,8 +966,17 @@ export default function Home() {
                     }}
                   >
                     <span>{category.label}</span>
-                    <strong>{formatNumber(category.count)}</strong>
-                    <small>{category.hours ? documentedHourLabel(category.hours) : "View completed records"}</small>
+                    <div className="category-card-metrics">
+                      <div>
+                        <strong>{formatNumber(category.count)}</strong>
+                        <small>Completions</small>
+                      </div>
+                      <div>
+                        <strong>{formatHours(category.hours)}</strong>
+                        <small>Documented hours</small>
+                      </div>
+                    </div>
+                    <small className="category-card-action">View completed records →</small>
                   </button>
                 ))}
               </div>
