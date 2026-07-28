@@ -186,7 +186,9 @@ label {
 
 .primary-button,
 .secondary-button,
-.upload-button {
+.upload-button,
+.manage-button,
+.danger-button {
   min-height: 43px;
   border-radius: 10px;
   padding: 0 17px;
@@ -218,6 +220,16 @@ label {
 .secondary-button:hover:not(:disabled) {
   border-color: #9cafbf;
   background: #f7f9fb;
+}
+
+.danger-button {
+  border: 1px solid #a92b2b;
+  background: #b93333;
+  color: #fff;
+}
+
+.danger-button:hover:not(:disabled) {
+  background: #992626;
 }
 
 .primary-button.full {
@@ -433,12 +445,29 @@ label {
   gap: 21px;
 }
 
+.report-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
 .upload-button {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   border-color: #2f82bb;
   background: #1a6fa9;
+}
+
+.manage-button {
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.08);
+  color: #e8f2f9;
+}
+
+.manage-button:hover:not(:disabled) {
+  border-color: rgba(255, 255, 255, 0.46);
+  background: rgba(255, 255, 255, 0.14);
 }
 
 .upload-button span {
@@ -953,6 +982,102 @@ label {
   width: min(100%, 1160px);
 }
 
+.imports-modal {
+  width: min(100%, 1180px);
+}
+
+.imports-table-wrap {
+  max-height: 58vh;
+}
+
+.imports-table th:last-child,
+.imports-table td:last-child {
+  width: 190px;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border-radius: 999px;
+  padding: 0 9px;
+  background: #eef2f5;
+  color: #546579;
+  font-size: 0.64rem;
+  font-weight: 800;
+}
+
+.status-pill.active,
+.status-pill.imported {
+  background: var(--green-100);
+  color: var(--green-700);
+}
+
+.status-pill.replaced,
+.status-pill.replaced-month {
+  background: var(--amber-100);
+  color: var(--amber-600);
+}
+
+.status-pill.deleted {
+  background: var(--red-100);
+  color: #8d2525;
+}
+
+.import-actions-cell {
+  min-width: 185px;
+}
+
+.secondary-text-button,
+.danger-text-button {
+  border: 0;
+  padding: 5px 0;
+  background: transparent;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.secondary-text-button {
+  display: block;
+  color: #17689f;
+}
+
+.danger-text-button {
+  display: block;
+  color: #a52d2d;
+}
+
+.secondary-text-button:hover:not(:disabled),
+.danger-text-button:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.detail-backdrop {
+  z-index: 110;
+}
+
+.inline-confirm {
+  display: grid;
+  gap: 7px;
+}
+
+.inline-confirm > span {
+  color: #8d2525;
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+
+.inline-confirm .danger-button {
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: 0.68rem;
+}
+
+.inline-confirm .text-button {
+  justify-self: start;
+  padding: 0;
+}
+
 .record-search {
   display: block;
   margin-bottom: 13px;
@@ -1075,7 +1200,8 @@ td small {
     gap: 9px;
   }
 
-  .upload-button {
+  .upload-button,
+  .manage-button {
     min-height: 40px;
     padding: 0 12px;
   }
@@ -1133,6 +1259,10 @@ td small {
     align-items: flex-start;
     flex-direction: column;
   }
+
+  .imports-table {
+    min-width: 900px;
+  }
 }
 
 @media (max-width: 480px) {
@@ -1145,8 +1275,13 @@ td small {
     height: 46px;
   }
 
-  .upload-button {
+  .upload-button,
+  .manage-button {
     font-size: 0.74rem;
+  }
+
+  .report-actions {
+    gap: 6px;
   }
 
   .summary-grid,
