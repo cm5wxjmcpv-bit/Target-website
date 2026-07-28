@@ -77,6 +77,18 @@ type ImportPreview = {
   duplicateCount: number;
 };
 
+type ImportHistoryItem = {
+  importId: string;
+  periodKey: string;
+  periodLabel: string;
+  fileName: string;
+  importedAt: string;
+  importedBy: string;
+  rowCount: number;
+  activeRecordCount: number;
+  status: string;
+};
+
 const CATEGORY_GROUPS = [
   {
     title: "Operations & Checks",
@@ -254,8 +266,10 @@ function dateParts(value: string) {
 }
 
 function periodLabel(periodKey: string) {
-  const [year, month] = periodKey.split("-").map(Number);
-  if (!year || !month) return periodKey;
+  const match = String(periodKey || "").match(/^(\d{4})-(0[1-9]|1[0-2])$/);
+  if (!match) return "Unknown reporting period";
+  const year = Number(match[1]);
+  const month = Number(match[2]);
   return new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" }).format(
     new Date(Date.UTC(year, month - 1, 1)),
   );
@@ -287,6 +301,12 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [importsOpen, setImportsOpen] = useState(false);
+  const [importHistory, setImportHistory] = useState<ImportHistoryItem[]>([]);
+  const [confirmDeleteId, setConfirmDeleteId] = useState("");
+  const [selectedImport, setSelectedImport] = useState<ImportHistoryItem | null>(null);
+  const [importRecords, setImportRecords] = useState<DashboardRecord[]>([]);
+  const [importRecordSearch, setImportRecordSearch] = useState("");
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<CategoryTotal | null>(null);
   const [recordSearch, setRecordSearch] = useState("");
@@ -550,9 +570,127 @@ export default function Home() {
       setViewMode("month");
       setSelectedPeriod(importPreview.periodKey);
       setDashboard(result.dashboard);
-      setMessage(`${formatNumber(result.importedRows)} records imported for ${importPreview.periodLabel}.`);
+      const skipped = Number(result.duplicateRowsSkipped) || 0;
+      setMessage(
+        `${formatNumber(result.importedRows)} records imported for ${importPreview.periodLabel}.` +
+        (skipped ? ` ${formatNumber(skipped)} duplicate ${skipped === 1 ? "record was" : "records were"} skipped.` : ""),
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The report could not be imported.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openImportHistory() {
+    if (!session) return;
+    if (demoMode) {
+      setImportHistory([
+        {
+          importId: "demo-current",
+          periodKey: "2026-06",
+          periodLabel: "June 2026",
+          fileName: "Monthly_Master_Completions_06_2026.csv",
+          importedAt: "Jul 28, 2026 2:12 PM",
+          importedBy: "Mlackey",
+          rowCount: 692,
+          activeRecordCount: 692,
+          status: "Active",
+        },
+        {
+          importId: "demo-duplicate",
+          periodKey: "2026-06",
+          periodLabel: "June 2026",
+          fileName: "Monthly_Master_Completions_06_2026.csv",
+          importedAt: "Jul 28, 2026 2:04 PM",
+          importedBy: "Mlackey",
+          rowCount: 692,
+          activeRecordCount: 692,
+          status: "Active",
+        },
+      ]);
+      setConfirmDeleteId("");
+      setImportsOpen(true);
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await callApi(apiUrl, {
+        action: "listImports",
+        session: session.token,
+      });
+      setImportHistory(result.imports || []);
+      setConfirmDeleteId("");
+      setImportsOpen(true);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Uploaded reports could not be loaded.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteImport(importId: string) {
+    if (!session) return;
+    if (demoMode) {
+      setImportHistory((items) =>
+        items.map((item) =>
+          item.importId === importId ? { ...item, activeRecordCount: 0, status: "Deleted" } : item,
+        ),
+      );
+      setConfirmDeleteId("");
+      setSelectedImport(null);
+      setMessage("Preview only: the selected upload would be deleted.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await callApi(apiUrl, {
+        action: "deleteImport",
+        session: session.token,
+        importId,
+        viewMode,
+        period: selectedPeriod,
+      });
+      setImportHistory(result.imports || []);
+      setDashboard(result.dashboard);
+      setSelectedPeriod(result.dashboard.selectedPeriod);
+      setConfirmDeleteId("");
+      setMessage(
+        `${formatNumber(result.deletedRows || 0)} completion ${result.deletedRows === 1 ? "record was" : "records were"} removed.`,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The uploaded report could not be deleted.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openImportRecords(item: ImportHistoryItem) {
+    if (!session || !item.activeRecordCount) return;
+    if (demoMode) {
+      setSelectedImport(item);
+      setImportRecords(DEMO_DATA.records);
+      setImportRecordSearch("");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await callApi(apiUrl, {
+        action: "getImportRecords",
+        session: session.token,
+        importId: item.importId,
+      });
+      setSelectedImport(item);
+      setImportRecords(result.records || []);
+      setImportRecordSearch("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The uploaded report could not be opened.");
     } finally {
       setBusy(false);
     }
@@ -567,6 +705,14 @@ export default function Home() {
       return Object.values(record).some((value) => String(value).toLowerCase().includes(needle));
     });
   }, [dashboard, recordSearch, selectedCategory]);
+
+  const visibleImportRecords = useMemo(() => {
+    const needle = importRecordSearch.trim().toLowerCase();
+    if (!needle) return importRecords;
+    return importRecords.filter((record) =>
+      Object.values(record).some((value) => String(value).toLowerCase().includes(needle)),
+    );
+  }, [importRecordSearch, importRecords]);
 
   if (!session) {
     return (
@@ -677,9 +823,16 @@ export default function Home() {
         </div>
 
         <div className="header-actions">
-          <button className="upload-button" onClick={() => setUploadOpen(true)}>
-            <span aria-hidden="true">↑</span> Upload Report
-          </button>
+          {session.role === "admin" && (
+            <div className="report-actions">
+              <button className="manage-button" onClick={() => void openImportHistory()} disabled={busy}>
+                Manage Uploads
+              </button>
+              <button className="upload-button" onClick={() => setUploadOpen(true)}>
+                <span aria-hidden="true">↑</span> Upload Report
+              </button>
+            </div>
+          )}
           <div className="user-menu">
             <span className="user-avatar">{session.displayName.slice(0, 1).toUpperCase()}</span>
             <div>
@@ -803,7 +956,7 @@ export default function Home() {
             <strong>Last import</strong>
             <span>
               {dashboard?.lastImport
-                ? `${dashboard.lastImport.fileName} · ${formatNumber(dashboard.lastImport.rowCount)} records`
+                ? `${dashboard.lastImport.fileName} · ${formatNumber(dashboard.lastImport.rowCount)} records · ${dashboard.lastImport.importedAt}`
                 : "No reports uploaded yet"}
             </span>
           </div>
@@ -862,6 +1015,136 @@ export default function Home() {
                   {busy ? "Importing…" : "Import & Update Dashboard"}
                 </button>
               )}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {importsOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => !busy && setImportsOpen(false)}>
+          <section className="modal-card imports-modal" role="dialog" aria-modal="true" aria-labelledby="imports-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow blue">Report administration</p>
+                <h2 id="imports-title">Uploaded reports</h2>
+                <p>Review every upload and remove a report with its completion records.</p>
+              </div>
+              <button className="close-button" onClick={() => setImportsOpen(false)} aria-label="Close">×</button>
+            </div>
+
+            <div className="table-wrap imports-table-wrap">
+              <table className="imports-table">
+                <thead>
+                  <tr>
+                    <th>Reporting period</th>
+                    <th>File</th>
+                    <th>Uploaded</th>
+                    <th>Records</th>
+                    <th>Status</th>
+                    <th><span className="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {importHistory.map((item) => (
+                    <tr key={item.importId}>
+                      <td><strong>{item.periodLabel}</strong></td>
+                      <td><strong>{item.fileName}</strong><small>by {item.importedBy || "Unknown user"}</small></td>
+                      <td>{item.importedAt || "—"}</td>
+                      <td>
+                        <strong>{formatNumber(item.activeRecordCount)}</strong>
+                        <small>{formatNumber(item.rowCount)} originally uploaded</small>
+                      </td>
+                      <td>
+                        <span className={`status-pill ${item.status.toLowerCase().replace(/\s+/g, "-")}`}>{item.status}</span>
+                      </td>
+                      <td className="import-actions-cell">
+                        {item.activeRecordCount > 0 && (
+                          <button className="secondary-text-button" onClick={() => void openImportRecords(item)} disabled={busy}>
+                            View records
+                          </button>
+                        )}
+                        {item.status !== "Deleted" && confirmDeleteId !== item.importId && (
+                          <button className="danger-text-button" onClick={() => setConfirmDeleteId(item.importId)} disabled={busy}>
+                            Delete
+                          </button>
+                        )}
+                        {confirmDeleteId === item.importId && (
+                          <div className="inline-confirm">
+                            <span>Delete this upload?</span>
+                            <button className="danger-button" onClick={() => void deleteImport(item.importId)} disabled={busy}>
+                              {busy ? "Deleting…" : "Yes, delete"}
+                            </button>
+                            <button className="text-button" onClick={() => setConfirmDeleteId("")} disabled={busy}>Cancel</button>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {!importHistory.length && (
+                    <tr><td className="empty-table" colSpan={6}>No reports have been uploaded.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="modal-actions">
+              <button className="secondary-button" onClick={() => setImportsOpen(false)} disabled={busy}>Close</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {selectedImport && (
+        <div className="modal-backdrop detail-backdrop" role="presentation" onMouseDown={() => setSelectedImport(null)}>
+          <section className="modal-card records-modal" role="dialog" aria-modal="true" aria-labelledby="import-records-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow blue">{selectedImport.periodLabel}</p>
+                <h2 id="import-records-title">{selectedImport.fileName}</h2>
+                <p>{formatNumber(importRecords.length)} active completion records · uploaded {selectedImport.importedAt}</p>
+              </div>
+              <button className="close-button" onClick={() => setSelectedImport(null)} aria-label="Close">×</button>
+            </div>
+            <label className="record-search">
+              <span className="sr-only">Search this upload</span>
+              <input
+                value={importRecordSearch}
+                onChange={(event) => setImportRecordSearch(event.target.value)}
+                placeholder="Search employee, training, shift, or date"
+              />
+            </label>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Employee</th>
+                    <th>Training / Activity</th>
+                    <th>Type</th>
+                    <th>Completed</th>
+                    <th>Hours</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleImportRecords.map((record, index) => (
+                    <tr key={`${record.employeeId}-${record.assignmentName}-${record.completionDate}-${index}`}>
+                      <td>
+                        <strong>{`${record.firstName} ${record.lastName}`.trim() || "Unknown"}</strong>
+                        <small>{record.employeeId || record.rank || "—"}</small>
+                      </td>
+                      <td>
+                        <strong>{record.assignmentName || "Untitled record"}</strong>
+                        <small>{record.location || record.instructor || "—"}</small>
+                      </td>
+                      <td>{record.assignmentType || "—"}</td>
+                      <td>{record.completionDate || "—"}<small>{record.completionTime || ""}</small></td>
+                      <td>{record.documentedHours ? formatHours(record.documentedHours) : "—"}</td>
+                    </tr>
+                  ))}
+                  {!visibleImportRecords.length && (
+                    <tr><td className="empty-table" colSpan={5}>No matching records.</td></tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </section>
         </div>
