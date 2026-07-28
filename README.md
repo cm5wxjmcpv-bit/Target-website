@@ -6,7 +6,9 @@ A professional, simple monthly completion dashboard for Martinsville Fire & EMS.
 
 - Signs users in from the Google Sheet `Users` tab
 - Imports TargetSolutions `Monthly Master Completions` CSV files
-- Detects and replaces previously uploaded months
+- Blocks repeat completion records and exact duplicate reports
+- Detects and replaces previously uploaded months when the report has changed
+- Lets administrators review, search, and delete uploaded report batches
 - Displays monthly, yearly, and all-time totals
 - Keeps every required dashboard area visible, including zero totals
 - Combines all training types into one Training total
@@ -35,6 +37,7 @@ The site is intentionally focused:
 
 - One dashboard
 - One upload flow
+- One upload-management screen for administrators
 - Month, year, and all-time period controls
 - No complicated account management screen
 - Users are managed directly from Google Sheets
