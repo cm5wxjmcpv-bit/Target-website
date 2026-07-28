@@ -322,9 +322,16 @@ export default function Home() {
   useEffect(() => {
     const timer = window.setTimeout(() => {
       const queryDemo = new URLSearchParams(window.location.search).get("demo") === "1";
-      const storedApiUrl = window.localStorage.getItem(APP_CONFIG.apiStorageKey) || APP_CONFIG.apiUrl;
+      const savedApiUrl = window.localStorage.getItem(APP_CONFIG.apiStorageKey) || "";
+      const storedApiUrl =
+        !savedApiUrl || APP_CONFIG.legacyApiUrls.includes(savedApiUrl)
+          ? APP_CONFIG.apiUrl
+          : savedApiUrl;
       const storedSession = window.sessionStorage.getItem(APP_CONFIG.sessionStorageKey);
 
+      if (storedApiUrl !== savedApiUrl) {
+        window.localStorage.setItem(APP_CONFIG.apiStorageKey, storedApiUrl);
+      }
       setDemoMode(queryDemo);
       setApiUrl(storedApiUrl);
       if (storedSession) {
