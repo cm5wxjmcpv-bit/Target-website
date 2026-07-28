@@ -275,6 +275,11 @@ function periodLabel(periodKey: string) {
   );
 }
 
+function supportsUploadManagement(version: string) {
+  const parts = String(version || "").split(".").map(Number);
+  return (parts[0] || 0) > 1 || ((parts[0] || 0) === 1 && (parts[1] || 0) >= 1);
+}
+
 async function callApi(apiUrl: string, payload: Record<string, unknown>) {
   const response = await fetch(apiUrl, {
     method: "POST",
@@ -291,6 +296,7 @@ export default function Home() {
   const [apiUrl, setApiUrl] = useState("");
   const [setupOpen, setSetupOpen] = useState(false);
   const [backendStatus, setBackendStatus] = useState<"unknown" | "connected" | "uninitialized" | "error">("unknown");
+  const [backendVersion, setBackendVersion] = useState("");
   const [session, setSession] = useState<UserSession | null>(null);
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -331,6 +337,7 @@ export default function Home() {
 
       if (queryDemo) {
         setBackendStatus("connected");
+        setBackendVersion("1.1.0");
         return;
       }
       if (storedApiUrl) {
@@ -369,6 +376,7 @@ export default function Home() {
     try {
       const result = await callApi(url, { action: "status" });
       setBackendStatus(result.initialized ? "connected" : "uninitialized");
+      setBackendVersion(String(result.version || ""));
       setMessage(result.initialized ? "Google Sheets is connected." : "Connected. The database needs to be set up.");
     } catch {
       setBackendStatus("error");
@@ -825,7 +833,12 @@ export default function Home() {
         <div className="header-actions">
           {session.role === "admin" && (
             <div className="report-actions">
-              <button className="manage-button" onClick={() => void openImportHistory()} disabled={busy}>
+              <button
+                className="manage-button"
+                onClick={() => void openImportHistory()}
+                disabled={busy || !supportsUploadManagement(backendVersion)}
+                title={!supportsUploadManagement(backendVersion) ? "Update the Apps Script backend to version 1.1" : undefined}
+              >
                 Manage Uploads
               </button>
               <button className="upload-button" onClick={() => setUploadOpen(true)}>
@@ -877,6 +890,11 @@ export default function Home() {
 
         {error && <div className="notice error dashboard-notice" role="alert">{error}</div>}
         {message && <div className="notice success dashboard-notice">{message}</div>}
+        {session.role === "admin" && backendStatus === "connected" && backendVersion && !supportsUploadManagement(backendVersion) && (
+          <div className="notice warning dashboard-notice">
+            Update and redeploy the Google Apps Script backend to enable Manage Uploads and full duplicate protection.
+          </div>
+        )}
         {demoMode && <div className="demo-banner">Dashboard preview using the June 2026 sample report.</div>}
 
         <section className="summary-grid" aria-label="Summary totals">
