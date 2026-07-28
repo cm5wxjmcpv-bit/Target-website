@@ -15,6 +15,15 @@
 11. Deploy and copy the `/exec` web app URL.
 12. Open the dashboard login page, select **Database setup**, paste the URL, and click **Connect**.
 
+## Updating an existing dashboard
+
+1. Open the Sheet’s **Extensions → Apps Script** project.
+2. Replace the current `Code.gs` with the complete updated `Code.gs` from this folder.
+3. Save, run `setupSystem` once, and approve permissions if Google asks.
+4. Select **Deploy → Manage deployments**, edit the existing web app deployment, choose **New version**, and deploy.
+
+Editing the existing deployment keeps the same `/exec` URL. Version 1.1 repairs reporting-period cells that Google Sheets converted into dates, prevents duplicate completion records, and enables the dashboard’s upload history, record viewer, and delete controls.
+
 The setup process creates these tabs automatically:
 
 - Settings
