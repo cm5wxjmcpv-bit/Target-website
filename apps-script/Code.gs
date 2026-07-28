@@ -7,7 +7,7 @@
  */
 
 const TARGET_DASHBOARD = {
-  version: "1.0.0",
+  version: "1.1.0",
   timezone: "America/New_York",
   sessionSeconds: 21600,
   sheets: {
@@ -76,6 +76,7 @@ const IMPORT_HEADERS = [
   "Imported By",
   "Row Count",
   "Status",
+  "Fingerprint",
 ];
 
 const USER_HEADERS = [
@@ -218,7 +219,35 @@ function doPost(event) {
       return jsonResponse_({
         ok: true,
         importedRows: importResult.importedRows,
+        duplicateRowsSkipped: importResult.duplicateRowsSkipped,
         dashboard: getDashboard_("month", payload.periodKey),
+      });
+    }
+
+    if (action === "listImports") {
+      requireAdmin_(user);
+      return jsonResponse_({
+        ok: true,
+        imports: listImports_(),
+      });
+    }
+
+    if (action === "getImportRecords") {
+      requireAdmin_(user);
+      return jsonResponse_({
+        ok: true,
+        records: getImportRecords_(payload.importId),
+      });
+    }
+
+    if (action === "deleteImport") {
+      requireAdmin_(user);
+      const deleteResult = deleteImport_(payload.importId, user);
+      return jsonResponse_({
+        ok: true,
+        deletedRows: deleteResult.deletedRows,
+        imports: listImports_(),
+        dashboard: getDashboard_(payload.viewMode, payload.period),
       });
     }
 
@@ -268,6 +297,8 @@ function setupSystem_(showAlert) {
   }
 
   formatSystemSheets_();
+  repairPeriodKeys_();
+  rebuildMonthlySummary_();
   SpreadsheetApp.flush();
 
   if (showAlert) {
@@ -323,6 +354,7 @@ function formatSystemSheets_() {
   const imports = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.imports);
   imports.setColumnWidths(1, IMPORT_HEADERS.length, 145);
   imports.setColumnWidth(3, 280);
+  imports.getRange(2, 2, Math.max(1, imports.getMaxRows() - 1), 1).setNumberFormat("@");
 
   const rules = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.categoryRules);
   rules.setColumnWidths(1, RULE_HEADERS.length, 150);
@@ -332,6 +364,7 @@ function formatSystemSheets_() {
   const completions = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
   completions.setColumnWidths(1, Math.min(COMPLETION_HEADERS.length, 12), 130);
   completions.setColumnWidth(14, 310);
+  completions.getRange(2, 2, Math.max(1, completions.getMaxRows() - 1), 1).setNumberFormat("@");
 }
 
 function defaultRules_() {
@@ -426,17 +459,27 @@ function importReport_(payload, user) {
   if (!lock.tryLock(30000)) throw new Error("Another import is running. Try again in a moment.");
 
   try {
-    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.completions);
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    ensureSheet_(TARGET_DASHBOARD.sheets.imports, IMPORT_HEADERS);
+    repairPeriodKeys_();
+
+    const sheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
+    const importSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.imports);
     const rules = loadRules_();
     const importId = Utilities.getUuid();
     const importedAt = new Date();
-    const seenTranscripts = {};
-    const output = [];
+    const fingerprint = fingerprintRecords_(payload.records);
+    const seenCompletionKeys = {};
+    let output = [];
+    let duplicateRowsSkipped = 0;
 
     payload.records.forEach(function (record) {
-      const transcriptId = String(record["Transcript ID"] || "").trim();
-      if (transcriptId && seenTranscripts[transcriptId]) return;
-      if (transcriptId) seenTranscripts[transcriptId] = true;
+      const completionKey = completionKeyFromRecord_(record);
+      if (seenCompletionKeys[completionKey]) {
+        duplicateRowsSkipped += 1;
+        return;
+      }
+      seenCompletionKeys[completionKey] = true;
 
       const categoryKey = classifyRecord_(record, rules);
       const documentedHours = documentedHours_(record);
@@ -458,28 +501,72 @@ function importReport_(payload, user) {
 
     const existing = sheet.getDataRange().getValues();
     const periodColumn = COMPLETION_HEADERS.indexOf("Period Key");
-    const periodExists = existing.slice(1).some(function (row) {
-      return String(row[periodColumn]) === periodKey;
+    const existingPeriodRows = existing.slice(1).filter(function (row) {
+      return normalizePeriodKey_(row[periodColumn]) === periodKey;
     });
+    const periodExists = existingPeriodRows.length > 0;
+
+    const existingKeys = {};
+    existingPeriodRows.forEach(function (row) {
+      existingKeys[completionKeyFromStoredRow_(row, headerMap_(existing[0] || COMPLETION_HEADERS))] = true;
+    });
+    const incomingKeyList = Object.keys(seenCompletionKeys).sort();
+    const existingKeyList = Object.keys(existingKeys).sort();
+    const sameCompletions =
+      incomingKeyList.length === existingKeyList.length &&
+      incomingKeyList.every(function (key, index) { return key === existingKeyList[index]; });
+
+    const importValues = importSheet.getDataRange().getValues();
+    const importHeaders = headerMap_(importValues[0] || IMPORT_HEADERS);
+    const fingerprintExists = importValues.slice(1).some(function (row) {
+      const status = String(row[importHeaders["Status"]] || "").toLowerCase();
+      return status !== "deleted" && fingerprint && String(row[importHeaders["Fingerprint"]] || "") === fingerprint;
+    });
+    if (fingerprintExists || sameCompletions) {
+      throw new Error("This report contains the same completion records as a report that is already uploaded.");
+    }
+
+    const completionHeaders = headerMap_(COMPLETION_HEADERS);
+    const otherPeriodKeys = {};
+    existing.slice(1).forEach(function (row) {
+      if (normalizePeriodKey_(row[periodColumn]) !== periodKey) {
+        otherPeriodKeys[completionKeyFromStoredRow_(row, completionHeaders)] = true;
+      }
+    });
+    output = output.filter(function (row) {
+      const alreadyStored = Boolean(otherPeriodKeys[completionKeyFromStoredRow_(row, completionHeaders)]);
+      if (alreadyStored) duplicateRowsSkipped += 1;
+      return !alreadyStored;
+    });
+    if (!output.length) {
+      throw new Error("Every completion in this report is already stored.");
+    }
+
     if (periodExists && !payload.replaceExisting) {
       throw new Error("That month was already imported.");
     }
 
     if (periodExists) {
       const retained = existing.slice(1).filter(function (row) {
-        return String(row[periodColumn]) !== periodKey;
+        return normalizePeriodKey_(row[periodColumn]) !== periodKey;
+      }).map(function (row) {
+        row[periodColumn] = normalizePeriodKey_(row[periodColumn]);
+        return row;
       });
       sheet.clearContents();
       sheet.getRange(1, 1, 1, COMPLETION_HEADERS.length).setValues([COMPLETION_HEADERS]);
+      sheet.getRange(2, periodColumn + 1, Math.max(1, sheet.getMaxRows() - 1), 1).setNumberFormat("@");
       if (retained.length) {
         sheet.getRange(2, 1, retained.length, COMPLETION_HEADERS.length).setValues(retained);
       }
+      markPeriodImportsReplaced_(periodKey);
     }
 
     const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, periodColumn + 1, output.length, 1).setNumberFormat("@");
     sheet.getRange(startRow, 1, output.length, COMPLETION_HEADERS.length).setValues(output);
 
-    const importSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.imports);
+    importSheet.getRange(importSheet.getLastRow() + 1, 2).setNumberFormat("@");
     importSheet.appendRow([
       importId,
       periodKey,
@@ -487,7 +574,8 @@ function importReport_(payload, user) {
       importedAt,
       user.username,
       output.length,
-      periodExists ? "Replaced month" : "Imported",
+      "Active",
+      fingerprint,
     ]);
 
     incrementDataVersion_();
@@ -498,7 +586,137 @@ function importReport_(payload, user) {
       periodKey + " · " + output.length + " records · " + String(payload.fileName || "")
     );
     SpreadsheetApp.flush();
-    return { importedRows: output.length };
+    return {
+      importedRows: output.length,
+      duplicateRowsSkipped: duplicateRowsSkipped,
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function listImports_() {
+  repairPeriodKeys_();
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const importSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.imports);
+  if (!importSheet || importSheet.getLastRow() < 2) return [];
+
+  const importValues = importSheet.getDataRange().getValues();
+  const headers = headerMap_(importValues[0] || IMPORT_HEADERS);
+  const activeCounts = activeImportRecordCounts_();
+
+  return importValues.slice(1).map(function (row) {
+    const importId = String(row[headers["Import ID"]] || "");
+    const periodKey = normalizePeriodKey_(row[headers["Period Key"]]);
+    const storedStatus = String(row[headers["Status"]] || "Imported");
+    const activeRecordCount = activeCounts[importId] || 0;
+    return {
+      importId: importId,
+      periodKey: periodKey,
+      periodLabel: dashboardPeriodLabel_("month", periodKey),
+      fileName: String(row[headers["File Name"]] || ""),
+      importedAt: formatTimestamp_(row[headers["Imported At"]]),
+      importedBy: String(row[headers["Imported By"]] || ""),
+      rowCount: Number(row[headers["Row Count"]]) || 0,
+      activeRecordCount: activeRecordCount,
+      status: storedStatus.toLowerCase() === "deleted"
+        ? "Deleted"
+        : activeRecordCount > 0
+          ? "Active"
+          : storedStatus,
+    };
+  }).filter(function (item) {
+    return Boolean(item.importId);
+  }).reverse();
+}
+
+function getImportRecords_(importId) {
+  const cleanImportId = String(importId || "").trim();
+  if (!cleanImportId) throw new Error("Choose an uploaded report to view.");
+
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const importSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.imports);
+  const importValues = importSheet.getDataRange().getValues();
+  const importHeaders = headerMap_(importValues[0] || IMPORT_HEADERS);
+  const importExists = importValues.slice(1).some(function (row) {
+    return String(row[importHeaders["Import ID"]] || "") === cleanImportId;
+  });
+  if (!importExists) throw new Error("That uploaded report could not be found.");
+
+  const completionSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
+  const completionValues = completionSheet.getDataRange().getValues();
+  const headers = headerMap_(completionValues[0] || COMPLETION_HEADERS);
+  return completionValues.slice(1).filter(function (row) {
+    return String(row[headers["Import ID"]] || "") === cleanImportId;
+  }).map(function (row) {
+    return dashboardRecordFromRow_(row, headers);
+  });
+}
+
+function deleteImport_(importId, user) {
+  const cleanImportId = String(importId || "").trim();
+  if (!cleanImportId) throw new Error("Choose an uploaded report to delete.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error("Another report change is running. Try again in a moment.");
+
+  try {
+    repairPeriodKeys_();
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const importSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.imports);
+    const importValues = importSheet.getDataRange().getValues();
+    const importHeaders = headerMap_(importValues[0] || IMPORT_HEADERS);
+    let importRowIndex = -1;
+    let fileName = "";
+    let periodKey = "";
+    for (let index = 1; index < importValues.length; index += 1) {
+      if (String(importValues[index][importHeaders["Import ID"]] || "") === cleanImportId) {
+        importRowIndex = index + 1;
+        fileName = String(importValues[index][importHeaders["File Name"]] || "");
+        periodKey = normalizePeriodKey_(importValues[index][importHeaders["Period Key"]]);
+        break;
+      }
+    }
+    if (importRowIndex < 0) throw new Error("That uploaded report could not be found.");
+
+    const statusColumn = importHeaders["Status"] + 1;
+    const currentStatus = String(importSheet.getRange(importRowIndex, statusColumn).getValue() || "");
+    if (currentStatus.toLowerCase() === "deleted") {
+      throw new Error("That uploaded report was already deleted.");
+    }
+
+    const completionSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
+    const completionValues = completionSheet.getDataRange().getValues();
+    const completionHeaders = headerMap_(completionValues[0] || COMPLETION_HEADERS);
+    const completionImportColumn = completionHeaders["Import ID"];
+    const periodColumn = completionHeaders["Period Key"];
+    let deletedRows = 0;
+    const retained = completionValues.slice(1).filter(function (row) {
+      const shouldDelete = String(row[completionImportColumn] || "") === cleanImportId;
+      if (shouldDelete) deletedRows += 1;
+      return !shouldDelete;
+    }).map(function (row) {
+      row[periodColumn] = normalizePeriodKey_(row[periodColumn]);
+      return row;
+    });
+
+    completionSheet.clearContents();
+    completionSheet.getRange(1, 1, 1, COMPLETION_HEADERS.length).setValues([COMPLETION_HEADERS]);
+    completionSheet.getRange(2, periodColumn + 1, Math.max(1, completionSheet.getMaxRows() - 1), 1).setNumberFormat("@");
+    if (retained.length) {
+      completionSheet.getRange(2, 1, retained.length, COMPLETION_HEADERS.length).setValues(retained);
+    }
+
+    importSheet.getRange(importRowIndex, statusColumn).setValue("Deleted");
+    incrementDataVersion_();
+    rebuildMonthlySummary_();
+    addAudit_(
+      user.username,
+      "Delete uploaded report",
+      periodKey + " · " + deletedRows + " records · " + fileName
+    );
+    SpreadsheetApp.flush();
+    return { deletedRows: deletedRows };
   } finally {
     lock.releaseLock();
   }
@@ -571,17 +789,106 @@ function documentedHours_(record) {
   return null;
 }
 
+function completionKeyFromRecord_(record) {
+  const transcriptId = canonicalValue_(record["Transcript ID"]);
+  if (transcriptId) return "transcript|" + transcriptId;
+  return [
+    "fallback",
+    canonicalValue_(record["Employee ID"] || record["TS UserID"]),
+    canonicalValue_(record["Assignment Name"]),
+    canonicalValue_(record["Completion Date"]),
+    canonicalValue_(record["Completion Time"]),
+    canonicalValue_(record["Course ID"]),
+  ].join("|");
+}
+
+function completionKeyFromStoredRow_(row, headers) {
+  const transcriptId = canonicalValue_(row[headers["Transcript ID"]]);
+  if (transcriptId) return "transcript|" + transcriptId;
+  return [
+    "fallback",
+    canonicalValue_(row[headers["Employee ID"]] || row[headers["TS UserID"]]),
+    canonicalValue_(row[headers["Assignment Name"]]),
+    formatSheetDate_(row[headers["Completion Date"]]),
+    canonicalValue_(row[headers["Completion Time"]]),
+    canonicalValue_(row[headers["Course ID"]]),
+  ].join("|");
+}
+
+function canonicalValue_(value) {
+  return String(value === undefined || value === null ? "" : value)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function fingerprintRecords_(records) {
+  const keys = {};
+  records.forEach(function (record) {
+    keys[completionKeyFromRecord_(record)] = true;
+  });
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    Object.keys(keys).sort().join("\n"),
+    Utilities.Charset.UTF_8
+  );
+  return digest.map(function (byte) {
+    const value = byte < 0 ? byte + 256 : byte;
+    return ("0" + value.toString(16)).slice(-2);
+  }).join("");
+}
+
+function activeImportRecordCounts_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.completions);
+  if (!sheet || sheet.getLastRow() < 2) return {};
+  const values = sheet.getDataRange().getValues();
+  const headers = headerMap_(values[0] || COMPLETION_HEADERS);
+  const counts = {};
+  values.slice(1).forEach(function (row) {
+    const importId = String(row[headers["Import ID"]] || "");
+    if (importId) counts[importId] = (counts[importId] || 0) + 1;
+  });
+  return counts;
+}
+
+function markPeriodImportsReplaced_(periodKey) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.imports);
+  if (!sheet || sheet.getLastRow() < 2) return;
+  const values = sheet.getDataRange().getValues();
+  const headers = headerMap_(values[0] || IMPORT_HEADERS);
+  const statusColumn = headers["Status"];
+  let changed = false;
+  for (let index = 1; index < values.length; index += 1) {
+    const status = String(values[index][statusColumn] || "");
+    if (normalizePeriodKey_(values[index][headers["Period Key"]]) === periodKey && status.toLowerCase() !== "deleted") {
+      values[index][statusColumn] = "Replaced";
+      changed = true;
+    }
+  }
+  if (changed) {
+    sheet.getRange(2, 1, values.length - 1, IMPORT_HEADERS.length).setValues(
+      values.slice(1).map(function (row) { return row.slice(0, IMPORT_HEADERS.length); })
+    );
+  }
+}
+
 function getDashboard_(viewMode, requestedPeriod) {
   const mode = ["month", "year", "all"].indexOf(String(viewMode)) !== -1 ? String(viewMode) : "month";
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.completions);
   const values = sheet.getDataRange().getValues();
   const headers = headerMap_(values[0] || COMPLETION_HEADERS);
+  const seenCompletionKeys = {};
   const allRows = values.slice(1).filter(function (row) {
     return row.some(function (cell) { return cell !== ""; });
+  }).filter(function (row) {
+    const key = completionKeyFromStoredRow_(row, headers);
+    if (seenCompletionKeys[key]) return false;
+    seenCompletionKeys[key] = true;
+    return true;
   });
 
   const periods = uniqueSorted_(allRows.map(function (row) {
-    return String(row[headers["Period Key"]] || "");
+    return normalizePeriodKey_(row[headers["Period Key"]]);
   }).filter(Boolean), true);
   const years = uniqueSorted_(periods.map(function (period) {
     return period.slice(0, 4);
@@ -593,7 +900,7 @@ function getDashboard_(viewMode, requestedPeriod) {
   if (mode === "all") selectedPeriod = "all";
 
   const rows = allRows.filter(function (row) {
-    const period = String(row[headers["Period Key"]] || "");
+    const period = normalizePeriodKey_(row[headers["Period Key"]]);
     if (mode === "month") return period === selectedPeriod;
     if (mode === "year") return period.slice(0, 4) === selectedPeriod;
     return true;
@@ -632,21 +939,7 @@ function getDashboard_(viewMode, requestedPeriod) {
     const lastName = String(row[headers["Last Name"]] || "");
     employees[employeeId || firstName + "|" + lastName] = true;
 
-    records.push({
-      categoryKey: category.key,
-      firstName: firstName,
-      lastName: lastName,
-      employeeId: employeeId,
-      shift: String(row[headers["Shift"]] || ""),
-      rank: String(row[headers["Rank"]] || ""),
-      assignmentName: String(row[headers["Assignment Name"]] || ""),
-      assignmentType: String(row[headers["Assignment Type"]] || ""),
-      completionDate: formatSheetDate_(row[headers["Completion Date"]]),
-      completionTime: String(row[headers["Completion Time"]] || ""),
-      documentedHours: hasHours ? Math.round(hours * 100) / 100 : 0,
-      instructor: String(row[headers["Instructor"]] || row[headers["Event Instructor"]] || ""),
-      location: String(row[headers["Location"]] || row[headers["Event Location"]] || ""),
-    });
+    records.push(dashboardRecordFromRow_(row, headers));
   });
 
   const categories = CATEGORY_DEFINITIONS.map(function (definition) {
@@ -687,6 +980,25 @@ function getDashboard_(viewMode, requestedPeriod) {
   };
 }
 
+function dashboardRecordFromRow_(row, headers) {
+  const hours = Number(row[headers["Documented Hours"]]);
+  return {
+    categoryKey: String(row[headers["Category Key"]] || "uncategorized"),
+    firstName: String(row[headers["First Name"]] || ""),
+    lastName: String(row[headers["Last Name"]] || ""),
+    employeeId: String(row[headers["Employee ID"]] || ""),
+    shift: String(row[headers["Shift"]] || ""),
+    rank: String(row[headers["Rank"]] || ""),
+    assignmentName: String(row[headers["Assignment Name"]] || ""),
+    assignmentType: String(row[headers["Assignment Type"]] || ""),
+    completionDate: formatSheetDate_(row[headers["Completion Date"]]),
+    completionTime: String(row[headers["Completion Time"]] || ""),
+    documentedHours: isFinite(hours) && hours > 0 ? Math.round(hours * 100) / 100 : 0,
+    instructor: String(row[headers["Instructor"]] || row[headers["Event Instructor"]] || ""),
+    location: String(row[headers["Location"]] || row[headers["Event Location"]] || ""),
+  };
+}
+
 function rebuildMonthlySummary_() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   const completionSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
@@ -699,8 +1011,12 @@ function rebuildMonthlySummary_() {
     labels[definition[0]] = definition[1];
   });
 
+  const seenCompletionKeys = {};
   values.slice(1).forEach(function (row) {
-    const period = String(row[headers["Period Key"]] || "");
+    const completionKey = completionKeyFromStoredRow_(row, headers);
+    if (seenCompletionKeys[completionKey]) return;
+    seenCompletionKeys[completionKey] = true;
+    const period = normalizePeriodKey_(row[headers["Period Key"]]);
     const categoryKey = String(row[headers["Category Key"]] || "uncategorized");
     if (!period) return;
     const key = period + "|" + categoryKey;
@@ -732,13 +1048,20 @@ function getLastImport_() {
   if (!sheet || sheet.getLastRow() < 2) return null;
   const values = sheet.getDataRange().getValues();
   const headers = headerMap_(values[0]);
-  const row = values[values.length - 1];
-  return {
-    fileName: String(row[headers["File Name"]] || ""),
-    periodKey: String(row[headers["Period Key"]] || ""),
-    importedAt: formatTimestamp_(row[headers["Imported At"]]),
-    rowCount: Number(row[headers["Row Count"]]) || 0,
-  };
+  const activeCounts = activeImportRecordCounts_();
+  for (let index = values.length - 1; index >= 1; index -= 1) {
+    const row = values[index];
+    const importId = String(row[headers["Import ID"]] || "");
+    const status = String(row[headers["Status"]] || "").toLowerCase();
+    if (status === "deleted" || !activeCounts[importId]) continue;
+    return {
+      fileName: String(row[headers["File Name"]] || ""),
+      periodKey: normalizePeriodKey_(row[headers["Period Key"]]),
+      importedAt: formatTimestamp_(row[headers["Imported At"]]),
+      rowCount: activeCounts[importId] || Number(row[headers["Row Count"]]) || 0,
+    };
+  }
+  return null;
 }
 
 function addAudit_(username, action, details) {
@@ -813,11 +1136,49 @@ function uniqueSorted_(values, descending) {
   });
 }
 
+function normalizePeriodKey_(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, TARGET_DASHBOARD.timezone, "yyyy-MM");
+  }
+
+  const text = String(value || "").trim();
+  const direct = text.match(/^(\d{4})-(\d{1,2})$/);
+  if (direct) {
+    const month = Number(direct[2]);
+    if (month >= 1 && month <= 12) return direct[1] + "-" + ("0" + month).slice(-2);
+  }
+
+  const parsed = new Date(text);
+  if (!isNaN(parsed.getTime())) {
+    return Utilities.formatDate(parsed, TARGET_DASHBOARD.timezone, "yyyy-MM");
+  }
+  return "";
+}
+
+function repairPeriodKeys_() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  [TARGET_DASHBOARD.sheets.completions, TARGET_DASHBOARD.sheets.imports].forEach(function (sheetName) {
+    const sheet = spreadsheet.getSheetByName(sheetName);
+    if (!sheet || sheet.getLastRow() < 2) return;
+    const headerValues = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const headers = headerMap_(headerValues);
+    const periodColumn = headers["Period Key"];
+    if (periodColumn === undefined) return;
+    const range = sheet.getRange(2, periodColumn + 1, sheet.getLastRow() - 1, 1);
+    const repaired = range.getValues().map(function (row) {
+      return [normalizePeriodKey_(row[0])];
+    });
+    range.setNumberFormat("@");
+    range.setValues(repaired);
+  });
+}
+
 function dashboardPeriodLabel_(mode, period) {
   if (mode === "all") return "All Time";
   if (mode === "year") return period || "No Data";
-  if (!period) return "No Reports Uploaded";
-  const parts = period.split("-");
+  const normalizedPeriod = normalizePeriodKey_(period);
+  if (!normalizedPeriod) return "No Reports Uploaded";
+  const parts = normalizedPeriod.split("-");
   const date = new Date(Number(parts[0]), Number(parts[1]) - 1, 1);
   return Utilities.formatDate(date, TARGET_DASHBOARD.timezone, "MMMM yyyy");
 }
