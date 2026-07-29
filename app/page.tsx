@@ -629,33 +629,53 @@ export default function Home() {
       setError("Update and redeploy the Google Apps Script backend before importing this report.");
       return;
     }
+    const preview = importPreview;
+    let completedMonths = 0;
     setBusy(true);
     setError("");
     setMessage("");
     try {
-      setImportProgress(`Validating and importing ${formatNumber(importPreview.periods.length)} ${importPreview.periods.length === 1 ? "month" : "months"}…`);
-      const result = await callApi(apiUrl, {
-        action: "importReportBatch",
-        session: session.token,
-        fileName: importPreview.fileName,
-        periods: importPreview.periods.map((period) => ({
-          periodKey: period.periodKey,
-          records: period.records,
-        })),
-        replaceExisting: true,
-      });
-      const latestPeriod = importPreview.periods[importPreview.periods.length - 1];
+      let importedRows = 0;
+      let duplicateRowsSkipped = 0;
+      let importedMonthCount = 0;
+      let latestDashboard: DashboardData | null = null;
+      const unchangedPeriods: string[] = [];
+
+      for (let index = 0; index < preview.periods.length; index += 1) {
+        const period = preview.periods[index];
+        setImportProgress(
+          `Importing ${period.periodLabel} (${formatNumber(index + 1)} of ${formatNumber(preview.periods.length)})…`,
+        );
+        const result = await callApi(apiUrl, {
+          action: "importReportBatch",
+          session: session.token,
+          fileName: preview.fileName,
+          periods: [{
+            periodKey: period.periodKey,
+            records: period.records,
+          }],
+          replaceExisting: true,
+        });
+        completedMonths += 1;
+        importedRows += Number(result.importedRows) || 0;
+        duplicateRowsSkipped += Number(result.duplicateRowsSkipped) || 0;
+        importedMonthCount += Number(result.importedMonthCount) || 0;
+        if (Array.isArray(result.unchangedPeriods)) {
+          unchangedPeriods.push(...result.unchangedPeriods.map(String));
+        }
+        if (result.dashboard) latestDashboard = result.dashboard;
+      }
+
+      const latestPeriod = preview.periods[preview.periods.length - 1];
+      setImportProgress("Refreshing the dashboard…");
       setUploadOpen(false);
       setImportPreview(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
       setViewMode("month");
       setSelectedPeriod(latestPeriod.periodKey);
-      setDashboard(result.dashboard);
+      if (latestDashboard) setDashboard(latestDashboard);
+      await loadDashboard("month", latestPeriod.periodKey);
 
-      const importedRows = Number(result.importedRows) || 0;
-      const duplicateRowsSkipped = Number(result.duplicateRowsSkipped) || 0;
-      const unchangedPeriods = Array.isArray(result.unchangedPeriods) ? result.unchangedPeriods : [];
-      const importedMonthCount = Number(result.importedMonthCount) || 0;
       const importedMessage = importedMonthCount
         ? `${formatNumber(importedRows)} records imported across ${formatNumber(importedMonthCount)} ${importedMonthCount === 1 ? "month" : "months"}.`
         : "Every month in this file is already uploaded.";
@@ -667,7 +687,11 @@ export default function Home() {
         : "";
       setMessage(importedMessage + unchangedMessage + duplicateMessage);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "The report could not be imported.");
+      const detail = caught instanceof Error ? caught.message : "The report could not be imported.";
+      const savedMessage = completedMonths
+        ? ` ${formatNumber(completedMonths)} of ${formatNumber(preview.periods.length)} ${preview.periods.length === 1 ? "month" : "months"} finished and remain saved. Check Manage Uploads before trying again.`
+        : "";
+      setError(detail + savedMessage);
     } finally {
       setImportProgress("");
       setBusy(false);
