@@ -7,7 +7,7 @@
  */
 
 const TARGET_DASHBOARD = {
-  version: "1.1.0",
+  version: "1.2.0",
   timezone: "America/New_York",
   sessionSeconds: 21600,
   sheets: {
@@ -209,18 +209,41 @@ function doPost(event) {
     if (action === "getDashboard") {
       return jsonResponse_({
         ok: true,
-        dashboard: getDashboard_(payload.viewMode, payload.period),
+        dashboard: getDashboard_(payload.viewMode, payload.period, payload.includeRecords !== false),
       });
     }
 
     if (action === "importReport") {
       requireAdmin_(user);
-      const importResult = importReport_(payload, user);
+      const importResult = importReportBatch_({
+        fileName: payload.fileName,
+        replaceExisting: payload.replaceExisting,
+        periods: [{
+          periodKey: payload.periodKey,
+          records: payload.records,
+        }],
+      }, user);
       return jsonResponse_({
         ok: true,
         importedRows: importResult.importedRows,
         duplicateRowsSkipped: importResult.duplicateRowsSkipped,
-        dashboard: getDashboard_("month", payload.periodKey),
+        importedMonthCount: importResult.importedMonthCount,
+        unchangedPeriods: importResult.unchangedPeriods,
+        dashboard: getDashboard_("month", payload.periodKey, true),
+      });
+    }
+
+    if (action === "importReportBatch") {
+      requireAdmin_(user);
+      const batchResult = importReportBatch_(payload, user);
+      const latestPeriod = batchResult.latestPeriod || "";
+      return jsonResponse_({
+        ok: true,
+        importedRows: batchResult.importedRows,
+        duplicateRowsSkipped: batchResult.duplicateRowsSkipped,
+        importedMonthCount: batchResult.importedMonthCount,
+        unchangedPeriods: batchResult.unchangedPeriods,
+        dashboard: getDashboard_("month", latestPeriod, false),
       });
     }
 
@@ -240,6 +263,13 @@ function doPost(event) {
       });
     }
 
+    if (action === "getCategoryRecords") {
+      return jsonResponse_({
+        ok: true,
+        records: getCategoryRecords_(payload.viewMode, payload.period, payload.categoryKey),
+      });
+    }
+
     if (action === "deleteImport") {
       requireAdmin_(user);
       const deleteResult = deleteImport_(payload.importId, user);
@@ -247,7 +277,7 @@ function doPost(event) {
         ok: true,
         deletedRows: deleteResult.deletedRows,
         imports: listImports_(),
-        dashboard: getDashboard_(payload.viewMode, payload.period),
+        dashboard: getDashboard_(payload.viewMode, payload.period, false),
       });
     }
 
@@ -327,6 +357,12 @@ function ensureSheet_(name, headers) {
       needsHeaders = true;
       break;
     }
+  }
+  if (needsHeaders && sheet.getLastRow() >= 2) {
+    throw new Error(
+      name + " contains data but its header row does not match the dashboard. " +
+      "Restore the expected headers before running Setup / Repair."
+    );
   }
   if (needsHeaders) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   sheet.setFrozenRows(1);
@@ -448,151 +484,330 @@ function logout_(token) {
   if (token) CacheService.getScriptCache().remove("session_" + String(token));
 }
 
-function importReport_(payload, user) {
-  if (!Array.isArray(payload.records) || !payload.records.length) {
-    throw new Error("The uploaded report does not contain any records.");
+function importReportBatch_(payload, user) {
+  if (!Array.isArray(payload.periods) || !payload.periods.length) {
+    throw new Error("The uploaded report does not contain any reporting months.");
   }
-  const periodKey = String(payload.periodKey || "").trim();
-  if (!/^\d{4}-\d{2}$/.test(periodKey)) throw new Error("The report month could not be determined.");
+
+  const requestedPeriods = [];
+  const seenPeriods = {};
+  payload.periods.forEach(function (periodPayload) {
+    const periodKey = strictPeriodKey_(periodPayload && periodPayload.periodKey);
+    if (!periodKey) throw new Error("The report contains an invalid reporting month.");
+    if (seenPeriods[periodKey]) throw new Error("The report contains the same reporting month more than once.");
+    if (!Array.isArray(periodPayload.records) || !periodPayload.records.length) {
+      throw new Error(dashboardPeriodLabel_("month", periodKey) + " does not contain any completion records.");
+    }
+    seenPeriods[periodKey] = true;
+    requestedPeriods.push({
+      periodKey: periodKey,
+      records: periodPayload.records,
+    });
+  });
 
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) throw new Error("Another import is running. Try again in a moment.");
 
   try {
-    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-    ensureSheet_(TARGET_DASHBOARD.sheets.imports, IMPORT_HEADERS);
+    requireHealthySystem_();
     repairPeriodKeys_();
 
-    const sheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const completionSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
     const importSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.imports);
+    const completionValues = completionSheet.getDataRange().getValues();
+    const importValues = importSheet.getDataRange().getValues();
+    const completionHeaders = headerMap_(completionValues[0] || COMPLETION_HEADERS);
+    const importHeaders = headerMap_(importValues[0] || IMPORT_HEADERS);
+    const periodColumn = completionHeaders["Period Key"];
     const rules = loadRules_();
-    const importId = Utilities.getUuid();
     const importedAt = new Date();
-    const fingerprint = fingerprintRecords_(payload.records);
-    const seenCompletionKeys = {};
-    let output = [];
+    const fileName = String(payload.fileName || "TargetSolutions report.csv");
+    const replaceExisting = payload.replaceExisting !== false;
     let duplicateRowsSkipped = 0;
+    const unchangedPeriods = [];
+    const preparedPeriods = [];
+    const incomingKeysAcrossBatch = {};
 
-    payload.records.forEach(function (record) {
-      const completionKey = completionKeyFromRecord_(record);
-      if (seenCompletionKeys[completionKey]) {
-        duplicateRowsSkipped += 1;
+    requestedPeriods.forEach(function (periodPayload) {
+      const periodKey = periodPayload.periodKey;
+      const periodLabel = dashboardPeriodLabel_("month", periodKey);
+      const importId = Utilities.getUuid();
+      const fingerprint = fingerprintRecords_(periodPayload.records);
+      const seenIncomingKeys = {};
+      let output = [];
+
+      periodPayload.records.forEach(function (record, index) {
+        const recordPeriod = completionDatePeriodKey_(record["Completion Date"]);
+        if (!recordPeriod) {
+          throw new Error(periodLabel + ": row " + (index + 1) + " has an invalid completion date.");
+        }
+        if (recordPeriod !== periodKey) {
+          throw new Error(
+            periodLabel + ": row " + (index + 1) + " belongs to " +
+            dashboardPeriodLabel_("month", recordPeriod) + "."
+          );
+        }
+
+        const completionKey = completionKeyFromRecord_(record);
+        if (seenIncomingKeys[completionKey] || incomingKeysAcrossBatch[completionKey]) {
+          duplicateRowsSkipped += 1;
+          return;
+        }
+        seenIncomingKeys[completionKey] = true;
+        incomingKeysAcrossBatch[completionKey] = true;
+
+        const categoryKey = classifyRecord_(record, rules);
+        const documentedHours = documentedHours_(record);
+        const row = [
+          importId,
+          periodKey,
+          categoryKey,
+          documentedHours === null ? "" : documentedHours,
+          importedAt,
+          user.username,
+        ];
+        SOURCE_HEADERS.forEach(function (header) {
+          row.push(record[header] === undefined || record[header] === null ? "" : String(record[header]));
+        });
+        output.push(row);
+      });
+
+      if (!output.length) throw new Error(periodLabel + " does not contain any unique completion records.");
+
+      const existingPeriodRows = completionValues.slice(1).filter(function (row) {
+        return normalizePeriodKey_(row[periodColumn]) === periodKey;
+      });
+      const existingKeys = {};
+      existingPeriodRows.forEach(function (row) {
+        existingKeys[completionKeyFromStoredRow_(row, completionHeaders)] = true;
+      });
+      const incomingKeyList = Object.keys(seenIncomingKeys).sort();
+      const existingKeyList = Object.keys(existingKeys).sort();
+      const sameCompletions =
+        incomingKeyList.length === existingKeyList.length &&
+        incomingKeyList.every(function (key, index) { return key === existingKeyList[index]; });
+
+      const fingerprintExists = importValues.slice(1).some(function (row) {
+        const status = String(row[importHeaders["Status"]] || "").toLowerCase();
+        return status !== "deleted" &&
+          fingerprint &&
+          String(row[importHeaders["Fingerprint"]] || "") === fingerprint;
+      });
+      if (fingerprintExists || sameCompletions) {
+        unchangedPeriods.push(periodLabel);
         return;
       }
-      seenCompletionKeys[completionKey] = true;
 
-      const categoryKey = classifyRecord_(record, rules);
-      const documentedHours = documentedHours_(record);
-      const row = [
-        importId,
-        periodKey,
-        categoryKey,
-        documentedHours === null ? "" : documentedHours,
+      if (existingPeriodRows.length && !replaceExisting) {
+        throw new Error(periodLabel + " was already imported.");
+      }
+
+      preparedPeriods.push({
+        periodKey: periodKey,
+        periodLabel: periodLabel,
+        importId: importId,
+        fingerprint: fingerprint,
+        output: output,
+        replacesExisting: existingPeriodRows.length > 0,
+      });
+    });
+
+    if (!preparedPeriods.length) {
+      return {
+        importedRows: 0,
+        duplicateRowsSkipped: duplicateRowsSkipped,
+        importedMonthCount: 0,
+        unchangedPeriods: unchangedPeriods,
+        latestPeriod: requestedPeriods[requestedPeriods.length - 1].periodKey,
+      };
+    }
+
+    const replacementPeriods = {};
+    preparedPeriods.forEach(function (period) {
+      replacementPeriods[period.periodKey] = true;
+    });
+
+    const retainedRows = completionValues.slice(1).filter(function (row) {
+      return !replacementPeriods[normalizePeriodKey_(row[periodColumn])];
+    }).map(function (row) {
+      const normalized = row.slice(0, COMPLETION_HEADERS.length);
+      while (normalized.length < COMPLETION_HEADERS.length) normalized.push("");
+      normalized[periodColumn] = normalizePeriodKey_(normalized[periodColumn]);
+      return normalized;
+    });
+    const retainedKeys = {};
+    retainedRows.forEach(function (row) {
+      retainedKeys[completionKeyFromStoredRow_(row, completionHeaders)] = true;
+    });
+
+    let importedRows = 0;
+    const finalPreparedPeriods = preparedPeriods.map(function (period) {
+      const uniqueOutput = period.output.filter(function (row) {
+        const key = completionKeyFromStoredRow_(row, headerMap_(COMPLETION_HEADERS));
+        if (retainedKeys[key]) {
+          duplicateRowsSkipped += 1;
+          return false;
+        }
+        retainedKeys[key] = true;
+        return true;
+      });
+      if (!uniqueOutput.length) {
+        throw new Error(period.periodLabel + ": every completion is already stored in another reporting month.");
+      }
+      importedRows += uniqueOutput.length;
+      period.output = uniqueOutput;
+      return period;
+    });
+
+    const nextCompletionRows = retainedRows.slice();
+    finalPreparedPeriods.forEach(function (period) {
+      nextCompletionRows = nextCompletionRows.concat(period.output);
+    });
+
+    const nextImportRows = importValues.slice(1).map(function (row) {
+      const normalized = row.slice(0, IMPORT_HEADERS.length);
+      while (normalized.length < IMPORT_HEADERS.length) normalized.push("");
+      const periodKey = normalizePeriodKey_(normalized[importHeaders["Period Key"]]);
+      const status = String(normalized[importHeaders["Status"]] || "");
+      if (replacementPeriods[periodKey] && status.toLowerCase() !== "deleted") {
+        normalized[importHeaders["Status"]] = "Replaced";
+      }
+      normalized[importHeaders["Period Key"]] = periodKey;
+      return normalized;
+    });
+    finalPreparedPeriods.forEach(function (period) {
+      nextImportRows.push([
+        period.importId,
+        period.periodKey,
+        fileName,
         importedAt,
         user.username,
-      ];
-      SOURCE_HEADERS.forEach(function (header) {
-        row.push(record[header] === undefined || record[header] === null ? "" : String(record[header]));
-      });
-      output.push(row);
+        period.output.length,
+        "Active",
+        period.fingerprint,
+      ]);
     });
 
-    if (!output.length) throw new Error("No unique completion records were found.");
-
-    const existing = sheet.getDataRange().getValues();
-    const periodColumn = COMPLETION_HEADERS.indexOf("Period Key");
-    const existingPeriodRows = existing.slice(1).filter(function (row) {
-      return normalizePeriodKey_(row[periodColumn]) === periodKey;
-    });
-    const periodExists = existingPeriodRows.length > 0;
-
-    const existingKeys = {};
-    existingPeriodRows.forEach(function (row) {
-      existingKeys[completionKeyFromStoredRow_(row, headerMap_(existing[0] || COMPLETION_HEADERS))] = true;
-    });
-    const incomingKeyList = Object.keys(seenCompletionKeys).sort();
-    const existingKeyList = Object.keys(existingKeys).sort();
-    const sameCompletions =
-      incomingKeyList.length === existingKeyList.length &&
-      incomingKeyList.every(function (key, index) { return key === existingKeyList[index]; });
-
-    const importValues = importSheet.getDataRange().getValues();
-    const importHeaders = headerMap_(importValues[0] || IMPORT_HEADERS);
-    const fingerprintExists = importValues.slice(1).some(function (row) {
-      const status = String(row[importHeaders["Status"]] || "").toLowerCase();
-      return status !== "deleted" && fingerprint && String(row[importHeaders["Fingerprint"]] || "") === fingerprint;
-    });
-    if (fingerprintExists || sameCompletions) {
-      throw new Error("This report contains the same completion records as a report that is already uploaded.");
+    replaceImportDataSafely_(nextCompletionRows, nextImportRows);
+    try {
+      incrementDataVersion_();
+      addAudit_(
+        user.username,
+        finalPreparedPeriods.some(function (period) { return period.replacesExisting; })
+          ? "Import or replace report batch"
+          : "Import report batch",
+        finalPreparedPeriods.map(function (period) {
+          return period.periodKey + " · " + period.output.length + " records";
+        }).join("; ") + " · " + fileName
+      );
+      SpreadsheetApp.flush();
+    } catch (metadataError) {
+      console.error("Import metadata update failed: " + String(metadataError));
     }
 
-    const completionHeaders = headerMap_(COMPLETION_HEADERS);
-    const otherPeriodKeys = {};
-    existing.slice(1).forEach(function (row) {
-      if (normalizePeriodKey_(row[periodColumn]) !== periodKey) {
-        otherPeriodKeys[completionKeyFromStoredRow_(row, completionHeaders)] = true;
-      }
-    });
-    output = output.filter(function (row) {
-      const alreadyStored = Boolean(otherPeriodKeys[completionKeyFromStoredRow_(row, completionHeaders)]);
-      if (alreadyStored) duplicateRowsSkipped += 1;
-      return !alreadyStored;
-    });
-    if (!output.length) {
-      throw new Error("Every completion in this report is already stored.");
-    }
-
-    if (periodExists && !payload.replaceExisting) {
-      throw new Error("That month was already imported.");
-    }
-
-    if (periodExists) {
-      const retained = existing.slice(1).filter(function (row) {
-        return normalizePeriodKey_(row[periodColumn]) !== periodKey;
-      }).map(function (row) {
-        row[periodColumn] = normalizePeriodKey_(row[periodColumn]);
-        return row;
-      });
-      sheet.clearContents();
-      sheet.getRange(1, 1, 1, COMPLETION_HEADERS.length).setValues([COMPLETION_HEADERS]);
-      sheet.getRange(2, periodColumn + 1, Math.max(1, sheet.getMaxRows() - 1), 1).setNumberFormat("@");
-      if (retained.length) {
-        sheet.getRange(2, 1, retained.length, COMPLETION_HEADERS.length).setValues(retained);
-      }
-      markPeriodImportsReplaced_(periodKey);
-    }
-
-    const startRow = sheet.getLastRow() + 1;
-    sheet.getRange(startRow, periodColumn + 1, output.length, 1).setNumberFormat("@");
-    sheet.getRange(startRow, 1, output.length, COMPLETION_HEADERS.length).setValues(output);
-
-    importSheet.getRange(importSheet.getLastRow() + 1, 2).setNumberFormat("@");
-    importSheet.appendRow([
-      importId,
-      periodKey,
-      String(payload.fileName || "TargetSolutions report.csv"),
-      importedAt,
-      user.username,
-      output.length,
-      "Active",
-      fingerprint,
-    ]);
-
-    incrementDataVersion_();
-    rebuildMonthlySummary_();
-    addAudit_(
-      user.username,
-      periodExists ? "Replace monthly report" : "Import monthly report",
-      periodKey + " · " + output.length + " records · " + String(payload.fileName || "")
-    );
-    SpreadsheetApp.flush();
     return {
-      importedRows: output.length,
+      importedRows: importedRows,
       duplicateRowsSkipped: duplicateRowsSkipped,
+      importedMonthCount: finalPreparedPeriods.length,
+      unchangedPeriods: unchangedPeriods,
+      latestPeriod: requestedPeriods[requestedPeriods.length - 1].periodKey,
     };
   } finally {
     lock.releaseLock();
   }
+}
+
+function replaceImportDataSafely_(completionRows, importRows) {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const completionSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
+  const importSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.imports);
+  const backupSuffix = String(new Date().getTime()) + "_" + Utilities.getUuid().slice(0, 8);
+  let completionBackup = null;
+  let importBackup = null;
+  try {
+    completionBackup = completionSheet.copyTo(spreadsheet)
+      .setName("_Backup_Completions_" + backupSuffix);
+    importBackup = importSheet.copyTo(spreadsheet)
+      .setName("_Backup_Imports_" + backupSuffix);
+    completionBackup.hideSheet();
+    importBackup.hideSheet();
+  } catch (backupError) {
+    deleteBackupSheets_(spreadsheet, [completionBackup, importBackup]);
+    throw new Error("A safety backup could not be created, so the report was not changed.");
+  }
+
+  try {
+    writeSheetRows_(completionSheet, COMPLETION_HEADERS, completionRows);
+    writeSheetRows_(importSheet, IMPORT_HEADERS, importRows);
+    rebuildMonthlySummary_();
+    SpreadsheetApp.flush();
+  } catch (error) {
+    let restored = false;
+    try {
+      writeSheetRows_(
+        completionSheet,
+        COMPLETION_HEADERS,
+        completionBackup.getDataRange().getValues().slice(1)
+      );
+      writeSheetRows_(
+        importSheet,
+        IMPORT_HEADERS,
+        importBackup.getDataRange().getValues().slice(1)
+      );
+      rebuildMonthlySummary_();
+      SpreadsheetApp.flush();
+      restored = true;
+    } catch (restoreError) {
+      console.error("Automatic import rollback failed: " + String(restoreError));
+    }
+
+    if (restored) {
+      deleteBackupSheets_(spreadsheet, [completionBackup, importBackup]);
+      throw new Error("The import was not saved. Your existing completion data was restored.");
+    }
+    throw new Error(
+      "The import could not be completed. Backup tabs were preserved in the spreadsheet for recovery."
+    );
+  }
+  deleteBackupSheets_(spreadsheet, [completionBackup, importBackup]);
+}
+
+function deleteBackupSheets_(spreadsheet, backupSheets) {
+  backupSheets.forEach(function (backupSheet) {
+    if (!backupSheet) return;
+    try {
+      spreadsheet.deleteSheet(backupSheet);
+    } catch (cleanupError) {
+      console.error("Backup cleanup failed: " + String(cleanupError));
+    }
+  });
+}
+
+function writeSheetRows_(sheet, headers, rows) {
+  if (sheet.getMaxColumns() < headers.length) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), headers.length - sheet.getMaxColumns());
+  }
+  const requiredRows = Math.max(2, rows.length + 1);
+  if (sheet.getMaxRows() < requiredRows) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), requiredRows - sheet.getMaxRows());
+  }
+
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (rows.length) {
+    const normalizedRows = rows.map(function (row) {
+      const normalized = row.slice(0, headers.length);
+      while (normalized.length < headers.length) normalized.push("");
+      return normalized;
+    });
+    sheet.getRange(2, 1, normalizedRows.length, headers.length).setValues(normalizedRows);
+  }
+  const periodColumn = headers.indexOf("Period Key");
+  if (periodColumn >= 0) {
+    sheet.getRange(2, periodColumn + 1, Math.max(1, sheet.getMaxRows() - 1), 1).setNumberFormat("@");
+  }
+  sheet.setFrozenRows(1);
 }
 
 function listImports_() {
@@ -661,6 +876,7 @@ function deleteImport_(importId, user) {
   if (!lock.tryLock(30000)) throw new Error("Another report change is running. Try again in a moment.");
 
   try {
+    requireHealthySystem_();
     repairPeriodKeys_();
     const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
     const importSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.imports);
@@ -679,8 +895,8 @@ function deleteImport_(importId, user) {
     }
     if (importRowIndex < 0) throw new Error("That uploaded report could not be found.");
 
-    const statusColumn = importHeaders["Status"] + 1;
-    const currentStatus = String(importSheet.getRange(importRowIndex, statusColumn).getValue() || "");
+    const statusColumn = importHeaders["Status"];
+    const currentStatus = String(importValues[importRowIndex - 1][statusColumn] || "");
     if (currentStatus.toLowerCase() === "deleted") {
       throw new Error("That uploaded report was already deleted.");
     }
@@ -700,22 +916,26 @@ function deleteImport_(importId, user) {
       return row;
     });
 
-    completionSheet.clearContents();
-    completionSheet.getRange(1, 1, 1, COMPLETION_HEADERS.length).setValues([COMPLETION_HEADERS]);
-    completionSheet.getRange(2, periodColumn + 1, Math.max(1, completionSheet.getMaxRows() - 1), 1).setNumberFormat("@");
-    if (retained.length) {
-      completionSheet.getRange(2, 1, retained.length, COMPLETION_HEADERS.length).setValues(retained);
-    }
+    const nextImportRows = importValues.slice(1).map(function (row, index) {
+      const normalized = row.slice(0, IMPORT_HEADERS.length);
+      while (normalized.length < IMPORT_HEADERS.length) normalized.push("");
+      normalized[importHeaders["Period Key"]] = normalizePeriodKey_(normalized[importHeaders["Period Key"]]);
+      if (index + 2 === importRowIndex) normalized[statusColumn] = "Deleted";
+      return normalized;
+    });
 
-    importSheet.getRange(importRowIndex, statusColumn).setValue("Deleted");
-    incrementDataVersion_();
-    rebuildMonthlySummary_();
-    addAudit_(
-      user.username,
-      "Delete uploaded report",
-      periodKey + " · " + deletedRows + " records · " + fileName
-    );
-    SpreadsheetApp.flush();
+    replaceImportDataSafely_(retained, nextImportRows);
+    try {
+      incrementDataVersion_();
+      addAudit_(
+        user.username,
+        "Delete uploaded report",
+        periodKey + " · " + deletedRows + " records · " + fileName
+      );
+      SpreadsheetApp.flush();
+    } catch (metadataError) {
+      console.error("Delete metadata update failed: " + String(metadataError));
+    }
     return { deletedRows: deletedRows };
   } finally {
     lock.releaseLock();
@@ -851,28 +1071,7 @@ function activeImportRecordCounts_() {
   return counts;
 }
 
-function markPeriodImportsReplaced_(periodKey) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.imports);
-  if (!sheet || sheet.getLastRow() < 2) return;
-  const values = sheet.getDataRange().getValues();
-  const headers = headerMap_(values[0] || IMPORT_HEADERS);
-  const statusColumn = headers["Status"];
-  let changed = false;
-  for (let index = 1; index < values.length; index += 1) {
-    const status = String(values[index][statusColumn] || "");
-    if (normalizePeriodKey_(values[index][headers["Period Key"]]) === periodKey && status.toLowerCase() !== "deleted") {
-      values[index][statusColumn] = "Replaced";
-      changed = true;
-    }
-  }
-  if (changed) {
-    sheet.getRange(2, 1, values.length - 1, IMPORT_HEADERS.length).setValues(
-      values.slice(1).map(function (row) { return row.slice(0, IMPORT_HEADERS.length); })
-    );
-  }
-}
-
-function getDashboard_(viewMode, requestedPeriod) {
+function getDashboard_(viewMode, requestedPeriod, includeRecords) {
   const mode = ["month", "year", "all"].indexOf(String(viewMode)) !== -1 ? String(viewMode) : "month";
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.completions);
   const values = sheet.getDataRange().getValues();
@@ -939,7 +1138,7 @@ function getDashboard_(viewMode, requestedPeriod) {
     const lastName = String(row[headers["Last Name"]] || "");
     employees[employeeId || firstName + "|" + lastName] = true;
 
-    records.push(dashboardRecordFromRow_(row, headers));
+    if (includeRecords !== false) records.push(dashboardRecordFromRow_(row, headers));
   });
 
   const categories = CATEGORY_DEFINITIONS.map(function (definition) {
@@ -980,6 +1179,40 @@ function getDashboard_(viewMode, requestedPeriod) {
   };
 }
 
+function getCategoryRecords_(viewMode, requestedPeriod, categoryKey) {
+  const validCategory = CATEGORY_DEFINITIONS.some(function (definition) {
+    return definition[0] === String(categoryKey || "");
+  });
+  if (!validCategory) throw new Error("Choose a valid dashboard category.");
+
+  const mode = ["month", "year", "all"].indexOf(String(viewMode)) !== -1 ? String(viewMode) : "month";
+  const selectedPeriod = mode === "all" ? "all" : String(requestedPeriod || "");
+  if (mode === "month" && !strictPeriodKey_(selectedPeriod)) {
+    throw new Error("Choose a valid reporting month.");
+  }
+  if (mode === "year" && !/^\d{4}$/.test(selectedPeriod)) {
+    throw new Error("Choose a valid reporting year.");
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.completions);
+  const values = sheet.getDataRange().getValues();
+  const headers = headerMap_(values[0] || COMPLETION_HEADERS);
+  const seenCompletionKeys = {};
+  return values.slice(1).filter(function (row) {
+    const key = completionKeyFromStoredRow_(row, headers);
+    if (seenCompletionKeys[key]) return false;
+    seenCompletionKeys[key] = true;
+
+    if (String(row[headers["Category Key"]] || "uncategorized") !== String(categoryKey)) return false;
+    const period = normalizePeriodKey_(row[headers["Period Key"]]);
+    if (mode === "month") return period === selectedPeriod;
+    if (mode === "year") return period.slice(0, 4) === selectedPeriod;
+    return true;
+  }).map(function (row) {
+    return dashboardRecordFromRow_(row, headers);
+  });
+}
+
 function dashboardRecordFromRow_(row, headers) {
   const hours = Number(row[headers["Documented Hours"]]);
   return {
@@ -1002,7 +1235,7 @@ function dashboardRecordFromRow_(row, headers) {
 function rebuildMonthlySummary_() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   const completionSheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.completions);
-  const summarySheet = spreadsheet.getSheetByName(TARGET_DASHBOARD.sheets.monthlySummary);
+  const summarySheet = ensureSheet_(TARGET_DASHBOARD.sheets.monthlySummary, SUMMARY_HEADERS);
   const values = completionSheet.getDataRange().getValues();
   const headers = headerMap_(values[0] || COMPLETION_HEADERS);
   const summary = {};
@@ -1100,18 +1333,34 @@ function incrementDataVersion_() {
   upsertSetting_("Data Version", String(current + 1));
 }
 
+function requiredSheetDefinitions_() {
+  return [
+    [TARGET_DASHBOARD.sheets.settings, ["Setting", "Value"]],
+    [TARGET_DASHBOARD.sheets.users, USER_HEADERS],
+    [TARGET_DASHBOARD.sheets.completions, COMPLETION_HEADERS],
+    [TARGET_DASHBOARD.sheets.imports, IMPORT_HEADERS],
+    [TARGET_DASHBOARD.sheets.categoryRules, RULE_HEADERS],
+    [TARGET_DASHBOARD.sheets.monthlySummary, SUMMARY_HEADERS],
+    [TARGET_DASHBOARD.sheets.auditLog, AUDIT_HEADERS],
+  ];
+}
+
 function isInitialized_() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const required = [
-    TARGET_DASHBOARD.sheets.settings,
-    TARGET_DASHBOARD.sheets.users,
-    TARGET_DASHBOARD.sheets.completions,
-    TARGET_DASHBOARD.sheets.imports,
-    TARGET_DASHBOARD.sheets.categoryRules,
-  ];
-  return required.every(function (name) {
-    return Boolean(spreadsheet.getSheetByName(name));
+  return requiredSheetDefinitions_().every(function (definition) {
+    const sheet = spreadsheet.getSheetByName(definition[0]);
+    if (!sheet || sheet.getLastColumn() < definition[1].length) return false;
+    const currentHeaders = sheet.getRange(1, 1, 1, definition[1].length).getValues()[0];
+    return definition[1].every(function (header, index) {
+      return currentHeaders[index] === header;
+    });
   });
+}
+
+function requireHealthySystem_() {
+  if (!isInitialized_()) {
+    throw new Error("The Google Sheet needs Setup / Repair before reports can be changed.");
+  }
 }
 
 function headerMap_(headers) {
@@ -1136,23 +1385,51 @@ function uniqueSorted_(values, descending) {
   });
 }
 
+function strictPeriodKey_(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{4})-(0[1-9]|1[0-2])$/);
+  return match ? match[1] + "-" + match[2] : "";
+}
+
+function completionDatePeriodKey_(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, TARGET_DASHBOARD.timezone, "yyyy-MM");
+  }
+
+  const match = String(value || "").trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return "";
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  const year = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return "";
+
+  const date = new Date(year, month - 1, day);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return "";
+  }
+  return String(year) + "-" + ("0" + month).slice(-2);
+}
+
 function normalizePeriodKey_(value) {
   if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
     return Utilities.formatDate(value, TARGET_DASHBOARD.timezone, "yyyy-MM");
   }
 
   const text = String(value || "").trim();
+  const strict = strictPeriodKey_(text);
+  if (strict) return strict;
+
   const direct = text.match(/^(\d{4})-(\d{1,2})$/);
   if (direct) {
     const month = Number(direct[2]);
     if (month >= 1 && month <= 12) return direct[1] + "-" + ("0" + month).slice(-2);
   }
 
-  const parsed = new Date(text);
-  if (!isNaN(parsed.getTime())) {
-    return Utilities.formatDate(parsed, TARGET_DASHBOARD.timezone, "yyyy-MM");
-  }
-  return "";
+  return completionDatePeriodKey_(text);
 }
 
 function repairPeriodKeys_() {
