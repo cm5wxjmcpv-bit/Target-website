@@ -7,7 +7,7 @@
  */
 
 const TARGET_DASHBOARD = {
-  version: "1.2.1",
+  version: "1.3.0",
   timezone: "America/New_York",
   sessionSeconds: 21600,
   sheets: {
@@ -209,7 +209,13 @@ function doPost(event) {
     if (action === "getDashboard") {
       return jsonResponse_({
         ok: true,
-        dashboard: getDashboard_(payload.viewMode, payload.period, payload.includeRecords !== false),
+        dashboard: getDashboard_(
+          payload.viewMode,
+          payload.period,
+          payload.includeRecords !== false,
+          payload.startDate,
+          payload.endDate
+        ),
       });
     }
 
@@ -266,7 +272,13 @@ function doPost(event) {
     if (action === "getCategoryRecords") {
       return jsonResponse_({
         ok: true,
-        records: getCategoryRecords_(payload.viewMode, payload.period, payload.categoryKey),
+        records: getCategoryRecords_(
+          payload.viewMode,
+          payload.period,
+          payload.categoryKey,
+          payload.startDate,
+          payload.endDate
+        ),
       });
     }
 
@@ -277,7 +289,13 @@ function doPost(event) {
         ok: true,
         deletedRows: deleteResult.deletedRows,
         imports: listImports_(),
-        dashboard: getDashboard_(payload.viewMode, payload.period, false),
+        dashboard: getDashboard_(
+          payload.viewMode,
+          payload.period,
+          false,
+          payload.startDate,
+          payload.endDate
+        ),
       });
     }
 
@@ -1071,8 +1089,9 @@ function activeImportRecordCounts_() {
   return counts;
 }
 
-function getDashboard_(viewMode, requestedPeriod, includeRecords) {
-  const mode = ["month", "year", "all"].indexOf(String(viewMode)) !== -1 ? String(viewMode) : "month";
+function getDashboard_(viewMode, requestedPeriod, includeRecords, requestedStartDate, requestedEndDate) {
+  const mode = ["month", "year", "range", "all"].indexOf(String(viewMode)) !== -1 ? String(viewMode) : "month";
+  const dateRange = mode === "range" ? strictDateRange_(requestedStartDate, requestedEndDate) : null;
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TARGET_DASHBOARD.sheets.completions);
   const values = sheet.getDataRange().getValues();
   const headers = headerMap_(values[0] || COMPLETION_HEADERS);
@@ -1096,12 +1115,17 @@ function getDashboard_(viewMode, requestedPeriod, includeRecords) {
   let selectedPeriod = String(requestedPeriod || "");
   if (mode === "month" && periods.indexOf(selectedPeriod) === -1) selectedPeriod = periods[0] || "";
   if (mode === "year" && years.indexOf(selectedPeriod) === -1) selectedPeriod = years[0] || "";
+  if (mode === "range") selectedPeriod = dateRange.startDate + "|" + dateRange.endDate;
   if (mode === "all") selectedPeriod = "all";
 
   const rows = allRows.filter(function (row) {
     const period = normalizePeriodKey_(row[headers["Period Key"]]);
     if (mode === "month") return period === selectedPeriod;
     if (mode === "year") return period.slice(0, 4) === selectedPeriod;
+    if (mode === "range") {
+      const completionDate = completionDateIsoKey_(row[headers["Completion Date"]]);
+      return completionDate >= dateRange.startDate && completionDate <= dateRange.endDate;
+    }
     return true;
   });
 
@@ -1155,8 +1179,15 @@ function getDashboard_(viewMode, requestedPeriod, includeRecords) {
 
   return {
     selectedPeriod: selectedPeriod,
-    periodLabel: dashboardPeriodLabel_(mode, selectedPeriod),
+    periodLabel: dashboardPeriodLabel_(
+      mode,
+      selectedPeriod,
+      dateRange && dateRange.startDate,
+      dateRange && dateRange.endDate
+    ),
     viewMode: mode,
+    rangeStart: dateRange ? dateRange.startDate : "",
+    rangeEnd: dateRange ? dateRange.endDate : "",
     periods: periods,
     years: years,
     totals: {
@@ -1179,13 +1210,14 @@ function getDashboard_(viewMode, requestedPeriod, includeRecords) {
   };
 }
 
-function getCategoryRecords_(viewMode, requestedPeriod, categoryKey) {
+function getCategoryRecords_(viewMode, requestedPeriod, categoryKey, requestedStartDate, requestedEndDate) {
   const validCategory = CATEGORY_DEFINITIONS.some(function (definition) {
     return definition[0] === String(categoryKey || "");
   });
   if (!validCategory) throw new Error("Choose a valid dashboard category.");
 
-  const mode = ["month", "year", "all"].indexOf(String(viewMode)) !== -1 ? String(viewMode) : "month";
+  const mode = ["month", "year", "range", "all"].indexOf(String(viewMode)) !== -1 ? String(viewMode) : "month";
+  const dateRange = mode === "range" ? strictDateRange_(requestedStartDate, requestedEndDate) : null;
   const selectedPeriod = mode === "all" ? "all" : String(requestedPeriod || "");
   if (mode === "month" && !strictPeriodKey_(selectedPeriod)) {
     throw new Error("Choose a valid reporting month.");
@@ -1207,6 +1239,10 @@ function getCategoryRecords_(viewMode, requestedPeriod, categoryKey) {
     const period = normalizePeriodKey_(row[headers["Period Key"]]);
     if (mode === "month") return period === selectedPeriod;
     if (mode === "year") return period.slice(0, 4) === selectedPeriod;
+    if (mode === "range") {
+      const completionDate = completionDateIsoKey_(row[headers["Completion Date"]]);
+      return completionDate >= dateRange.startDate && completionDate <= dateRange.endDate;
+    }
     return true;
   }).map(function (row) {
     return dashboardRecordFromRow_(row, headers);
@@ -1414,6 +1450,43 @@ function completionDatePeriodKey_(value) {
   return String(year) + "-" + ("0" + month).slice(-2);
 }
 
+function strictIsoDate_(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return "";
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(year, month - 1, day);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return "";
+  }
+  return match[1] + "-" + match[2] + "-" + match[3];
+}
+
+function strictDateRange_(startDate, endDate) {
+  const start = strictIsoDate_(startDate);
+  const end = strictIsoDate_(endDate);
+  if (!start || !end) throw new Error("Choose a valid start and end date.");
+  if (start > end) throw new Error("The start date must be on or before the end date.");
+  return { startDate: start, endDate: end };
+}
+
+function completionDateIsoKey_(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, TARGET_DASHBOARD.timezone, "yyyy-MM-dd");
+  }
+  const match = String(value || "").trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return "";
+  return strictIsoDate_(
+    match[3] + "-" + ("0" + Number(match[1])).slice(-2) + "-" + ("0" + Number(match[2])).slice(-2)
+  );
+}
+
 function normalizePeriodKey_(value) {
   if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
     return Utilities.formatDate(value, TARGET_DASHBOARD.timezone, "yyyy-MM");
@@ -1450,14 +1523,26 @@ function repairPeriodKeys_() {
   });
 }
 
-function dashboardPeriodLabel_(mode, period) {
+function dashboardPeriodLabel_(mode, period, startDate, endDate) {
   if (mode === "all") return "All Time";
   if (mode === "year") return period || "No Data";
+  if (mode === "range") return isoDateLabel_(startDate) + " – " + isoDateLabel_(endDate);
   const normalizedPeriod = normalizePeriodKey_(period);
   if (!normalizedPeriod) return "No Reports Uploaded";
   const parts = normalizedPeriod.split("-");
   const date = new Date(Number(parts[0]), Number(parts[1]) - 1, 1);
   return Utilities.formatDate(date, TARGET_DASHBOARD.timezone, "MMMM yyyy");
+}
+
+function isoDateLabel_(value) {
+  const date = strictIsoDate_(value);
+  if (!date) return "Invalid Date";
+  const parts = date.split("-");
+  const monthNames = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  ];
+  return monthNames[Number(parts[1]) - 1] + " " + Number(parts[2]) + ", " + parts[0];
 }
 
 function formatSheetDate_(value) {
