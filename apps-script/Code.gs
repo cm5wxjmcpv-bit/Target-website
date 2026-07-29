@@ -7,7 +7,7 @@
  */
 
 const TARGET_DASHBOARD = {
-  version: "1.2.0",
+  version: "1.2.1",
   timezone: "America/New_York",
   sessionSeconds: 21600,
   sheets: {
@@ -660,7 +660,7 @@ function importReportBatch_(payload, user) {
       return period;
     });
 
-    const nextCompletionRows = retainedRows.slice();
+    let nextCompletionRows = retainedRows.slice();
     finalPreparedPeriods.forEach(function (period) {
       nextCompletionRows = nextCompletionRows.concat(period.output);
     });
