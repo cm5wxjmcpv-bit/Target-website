@@ -2,6 +2,14 @@
 
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { APP_CONFIG } from "./config";
+import {
+  canonicalizeHeader,
+  duplicateRecordCount,
+  findTargetHeaderIndex,
+  parseCompletionDate,
+  parseCsv,
+  periodLabel,
+} from "./report-utils";
 
 type ViewMode = "month" | "year" | "all";
 
@@ -142,83 +150,6 @@ const CATEGORY_GROUPS = [
   },
 ] as const;
 
-const DEMO_CATEGORIES: CategoryTotal[] = [
-  { key: "apparatus_checks", label: "Apparatus Checks", section: "operations", count: 251, hours: 0 },
-  { key: "ems_weekly_checks", label: "EMS Weekly Checks", section: "operations", count: 17, hours: 0 },
-  { key: "scba_checks", label: "SCBA Checks", section: "operations", count: 15, hours: 3.75 },
-  { key: "training", label: "Training", section: "training", count: 350, hours: 764.46 },
-  { key: "pre_incident_planning", label: "Pre-incident Planning", section: "daily", count: 0, hours: 0 },
-  { key: "public_ed_in_station", label: "Public Ed In Station", section: "daily", count: 0, hours: 0 },
-  { key: "public_ed_off_site", label: "Public Ed Off Site", section: "daily", count: 8, hours: 12 },
-  { key: "smoke_detector", label: "Smoke Detector", section: "daily", count: 4, hours: 2 },
-  { key: "child_seats", label: "Child Seats", section: "daily", count: 13, hours: 6.5 },
-  { key: "other_activities", label: "Other Activities", section: "daily", count: 6, hours: 1 },
-  { key: "fire_inspection", label: "Fire Inspection", section: "fireMarshal", count: 17, hours: 0 },
-  { key: "building_inspection", label: "Building Inspection", section: "fireMarshal", count: 6, hours: 0 },
-  { key: "drone_flights", label: "Drone Flights", section: "fireMarshal", count: 2, hours: 1 },
-  { key: "fire_permits", label: "Fire Permits", section: "fireMarshal", count: 1, hours: 0 },
-  { key: "swat_activation", label: "SWAT Activation", section: "fireMarshal", count: 0, hours: 0 },
-  { key: "swat_training", label: "SWAT Training", section: "fireMarshal", count: 2, hours: 3 },
-  { key: "fire_investigations", label: "Fire Investigations", section: "fireMarshal", count: 0, hours: 0 },
-  { key: "uncategorized", label: "Uncategorized", section: "uncategorized", count: 0, hours: 0 },
-];
-
-const DEMO_DATA: DashboardData = {
-  selectedPeriod: "2026-06",
-  periodLabel: "June 2026",
-  viewMode: "month",
-  periods: ["2026-06"],
-  years: ["2026"],
-  totals: {
-    completions: 692,
-    employees: 34,
-    hours: 783.71,
-    hoursRecords: 418,
-    missingHours: 274,
-    training: 350,
-  },
-  sections: { operations: 283, daily: 31, fireMarshal: 28, uncategorized: 0 },
-  categories: DEMO_CATEGORIES,
-  records: [
-    {
-      categoryKey: "training",
-      firstName: "Michael",
-      lastName: "Barrett",
-      employeeId: "Barr02",
-      shift: "C-Shift",
-      rank: "Firefighter",
-      assignmentName: "Company Training - MF-EMS",
-      assignmentType: "MF-EMS Training",
-      completionDate: "06/30/2026",
-      completionTime: "03:00 PM",
-      documentedHours: 7,
-      instructor: "Eric Dillon",
-      location: "HCDPS",
-    },
-    {
-      categoryKey: "apparatus_checks",
-      firstName: "Donald",
-      lastName: "Workman",
-      employeeId: "0191",
-      shift: "B-Shift",
-      rank: "Firefighter",
-      assignmentName: "Engine 2 - Daily Check",
-      assignmentType: "Apparatus Checks",
-      completionDate: "06/01/2026",
-      completionTime: "06:58 AM",
-      documentedHours: 0,
-      instructor: "",
-      location: "",
-    },
-  ],
-  lastImport: {
-    fileName: "Monthly_Master_Completions_06_2026.csv",
-    periodKey: "2026-06",
-    importedAt: "July 27, 2026 at 1:21 PM",
-    rowCount: 692,
-  },
-};
-
 function formatNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value || 0);
 }
@@ -230,63 +161,17 @@ function formatHours(value: number) {
   }).format(value || 0);
 }
 
-function parseCsv(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let value = "";
-  let quoted = false;
-
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    const next = text[index + 1];
-
-    if (char === '"') {
-      if (quoted && next === '"') {
-        value += '"';
-        index += 1;
-      } else {
-        quoted = !quoted;
-      }
-    } else if (char === "," && !quoted) {
-      row.push(value);
-      value = "";
-    } else if ((char === "\n" || char === "\r") && !quoted) {
-      if (char === "\r" && next === "\n") index += 1;
-      row.push(value);
-      if (row.some((cell) => cell !== "")) rows.push(row);
-      row = [];
-      value = "";
-    } else {
-      value += char;
-    }
-  }
-
-  if (value || row.length) {
-    row.push(value);
-    if (row.some((cell) => cell !== "")) rows.push(row);
-  }
-  return rows;
-}
-
-function dateParts(value: string) {
-  const match = String(value || "").trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (!match) return null;
-  return { month: Number(match[1]), day: Number(match[2]), year: Number(match[3]) };
-}
-
-function periodLabel(periodKey: string) {
-  const match = String(periodKey || "").match(/^(\d{4})-(0[1-9]|1[0-2])$/);
-  if (!match) return "Unknown reporting period";
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  return new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" }).format(
-    new Date(Date.UTC(year, month - 1, 1)),
-  );
-}
-
 function supportsUploadManagement(version: string) {
   const parts = String(version || "").split(".").map(Number);
   return (parts[0] || 0) > 1 || ((parts[0] || 0) === 1 && (parts[1] || 0) >= 1);
+}
+
+function supportsSafeBatchImport(version: string) {
+  const parts = String(version || "").split(".").map(Number);
+  const major = parts[0] || 0;
+  const minor = parts[1] || 0;
+  const patch = parts[2] || 0;
+  return major > 1 || (major === 1 && (minor > 2 || (minor === 2 && patch >= 1)));
 }
 
 async function callApi(apiUrl: string, payload: Record<string, unknown>) {
@@ -326,17 +211,22 @@ export default function Home() {
   const [importProgress, setImportProgress] = useState("");
   const [isDragActive, setIsDragActive] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<CategoryTotal | null>(null);
+  const [selectedCategoryRecords, setSelectedCategoryRecords] = useState<DashboardRecord[]>([]);
+  const [categoryRecordsLoading, setCategoryRecordsLoading] = useState(false);
   const [recordSearch, setRecordSearch] = useState("");
-  const [demoMode, setDemoMode] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
+  const dashboardRequestRef = useRef(0);
+  const uploadDialogRef = useRef<HTMLElement>(null);
+  const importsDialogRef = useRef<HTMLElement>(null);
+  const importRecordsDialogRef = useRef<HTMLElement>(null);
+  const categoryRecordsDialogRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      const queryDemo = new URLSearchParams(window.location.search).get("demo") === "1";
       const savedApiUrl = window.localStorage.getItem(APP_CONFIG.apiStorageKey) || "";
       const storedApiUrl =
-        !savedApiUrl || APP_CONFIG.legacyApiUrls.includes(savedApiUrl)
+        !savedApiUrl || (APP_CONFIG.legacyApiUrls as readonly string[]).includes(savedApiUrl)
           ? APP_CONFIG.apiUrl
           : savedApiUrl;
       const storedSession = window.sessionStorage.getItem(APP_CONFIG.sessionStorageKey);
@@ -344,21 +234,20 @@ export default function Home() {
       if (storedApiUrl !== savedApiUrl) {
         window.localStorage.setItem(APP_CONFIG.apiStorageKey, storedApiUrl);
       }
-      setDemoMode(queryDemo);
       setApiUrl(storedApiUrl);
       if (storedSession) {
         try {
-          setSession(JSON.parse(storedSession));
+          const parsedSession = JSON.parse(storedSession) as UserSession;
+          if (parsedSession?.token === "demo") {
+            window.sessionStorage.removeItem(APP_CONFIG.sessionStorageKey);
+          } else {
+            setSession(parsedSession);
+          }
         } catch {
           window.sessionStorage.removeItem(APP_CONFIG.sessionStorageKey);
         }
       }
 
-      if (queryDemo) {
-        setBackendStatus("connected");
-        setBackendVersion("1.1.0");
-        return;
-      }
       if (storedApiUrl) {
         void checkBackend(storedApiUrl);
       } else {
@@ -373,17 +262,12 @@ export default function Home() {
   useEffect(() => {
     if (!session) return;
     const timer = window.setTimeout(() => {
-      if (demoMode) {
-        setDashboard({ ...DEMO_DATA, viewMode, selectedPeriod: selectedPeriod || DEMO_DATA.selectedPeriod });
-        if (!selectedPeriod) setSelectedPeriod(DEMO_DATA.selectedPeriod);
-        return;
-      }
       void loadDashboard(viewMode, selectedPeriod);
     }, 0);
     return () => window.clearTimeout(timer);
     // The initial dashboard load is tied to a successful login/session restore.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session, demoMode]);
+  }, [session]);
 
   useEffect(() => {
     if (!uploadOpen) return;
@@ -399,6 +283,72 @@ export default function Home() {
       window.removeEventListener("drop", preventBrowserFileOpen);
     };
   }, [uploadOpen]);
+
+  useEffect(() => {
+    const dialog = selectedImport
+      ? importRecordsDialogRef.current
+      : selectedCategory
+        ? categoryRecordsDialogRef.current
+        : importsOpen
+          ? importsDialogRef.current
+          : uploadOpen
+            ? uploadDialogRef.current
+            : null;
+    if (!dialog) return;
+    const activeDialog = dialog;
+
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const focusableSelector = [
+      "button:not([disabled])",
+      "input:not([disabled])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "[href]",
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(",");
+    const focusFirst = window.setTimeout(() => {
+      activeDialog.querySelector<HTMLElement>(focusableSelector)?.focus();
+    }, 0);
+
+    function handleDialogKeydown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (selectedImport) setSelectedImport(null);
+        else if (selectedCategory) setSelectedCategory(null);
+        else if (importsOpen && !busy) setImportsOpen(false);
+        else if (uploadOpen && !busy) setUploadOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+
+      const focusable = Array.from(activeDialog.querySelectorAll<HTMLElement>(focusableSelector))
+        .filter((element) => element.offsetParent !== null);
+      if (!focusable.length) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener("keydown", handleDialogKeydown);
+    return () => {
+      window.clearTimeout(focusFirst);
+      document.removeEventListener("keydown", handleDialogKeydown);
+      document.body.style.overflow = previousOverflow;
+      previousFocus?.focus();
+    };
+  }, [busy, importsOpen, selectedCategory, selectedImport, uploadOpen]);
 
   async function checkBackend(url = apiUrl) {
     if (!url) {
@@ -423,7 +373,8 @@ export default function Home() {
   async function saveConnection(event: FormEvent) {
     event.preventDefault();
     const cleanUrl = apiUrl.trim();
-    if (!cleanUrl.startsWith("https://script.google.com/")) {
+    const isAgentPreview = window.location.hostname === "terminal.local";
+    if (!cleanUrl.startsWith("https://script.google.com/") && !isAgentPreview) {
       setError("Enter the deployed Google Apps Script web app URL.");
       return;
     }
@@ -452,19 +403,13 @@ export default function Home() {
     setError("");
     setMessage("");
     try {
-      let nextSession: UserSession;
-      if (demoMode) {
-        if (loginUsername !== "demo" || loginPassword !== "demo") throw new Error("Use demo / demo for this preview.");
-        nextSession = { token: "demo", displayName: "Dashboard Preview", username: "demo", role: "admin" };
-      } else {
-        if (backendStatus !== "connected") throw new Error("Connect and set up the Google Sheet first.");
-        const result = await callApi(apiUrl, {
-          action: "login",
-          username: loginUsername,
-          password: loginPassword,
-        });
-        nextSession = result.session;
-      }
+      if (backendStatus !== "connected") throw new Error("Connect and set up the Google Sheet first.");
+      const result = await callApi(apiUrl, {
+        action: "login",
+        username: loginUsername,
+        password: loginPassword,
+      });
+      const nextSession: UserSession = result.session;
       window.sessionStorage.setItem(APP_CONFIG.sessionStorageKey, JSON.stringify(nextSession));
       setSession(nextSession);
     } catch (caught) {
@@ -475,7 +420,7 @@ export default function Home() {
   }
 
   async function handleLogout() {
-    if (session && !demoMode) {
+    if (session) {
       try {
         await callApi(apiUrl, { action: "logout", session: session.token });
       } catch {
@@ -490,30 +435,28 @@ export default function Home() {
 
   async function loadDashboard(mode: ViewMode, period: string) {
     if (!session) return;
+    const requestId = dashboardRequestRef.current + 1;
+    dashboardRequestRef.current = requestId;
     setBusy(true);
     setError("");
     try {
-      if (demoMode) {
-        const label = mode === "all" ? "All Time" : mode === "year" ? "2026" : "June 2026";
-        const data = { ...DEMO_DATA, viewMode: mode, periodLabel: label, selectedPeriod: mode === "year" ? "2026" : "2026-06" };
-        setDashboard(data);
-        setSelectedPeriod(data.selectedPeriod);
-        return;
-      }
       const result = await callApi(apiUrl, {
         action: "getDashboard",
         session: session.token,
         viewMode: mode,
         period,
+        includeRecords: false,
       });
+      if (requestId !== dashboardRequestRef.current) return;
       setDashboard(result.dashboard);
       setSelectedPeriod(result.dashboard.selectedPeriod);
     } catch (caught) {
+      if (requestId !== dashboardRequestRef.current) return;
       const text = caught instanceof Error ? caught.message : "Dashboard data could not be loaded.";
       setError(text);
       if (/session|sign in/i.test(text)) await handleLogout();
     } finally {
-      setBusy(false);
+      if (requestId === dashboardRequestRef.current) setBusy(false);
     }
   }
 
@@ -544,10 +487,10 @@ export default function Home() {
 
       const text = await file.text();
       const rows = parseCsv(text);
-      const headerIndex = rows.findIndex((row) => row[0] === "First Name" && row[1] === "Last Name");
+      const headerIndex = findTargetHeaderIndex(rows);
       if (headerIndex < 0) throw new Error("This does not appear to be a TargetSolutions Master Completions CSV.");
 
-      const headers = rows[headerIndex].map((header) => header.trim());
+      const headers = rows[headerIndex].map(canonicalizeHeader);
       const required = ["First Name", "Last Name", "Employee ID", "Assignment Name", "Completion Date", "Transcript ID"];
       const missing = required.filter((header) => !headers.includes(header));
       if (missing.length) throw new Error(`The report is missing required columns: ${missing.join(", ")}`);
@@ -561,7 +504,7 @@ export default function Home() {
       const datedRecords = records.map((record) => ({
         record,
         raw: record["Completion Date"],
-        parts: dateParts(record["Completion Date"]),
+        parts: parseCompletionDate(record["Completion Date"]),
       }));
       const invalidDateCount = datedRecords.filter((item) => !item.parts).length;
       if (invalidDateCount) {
@@ -577,7 +520,7 @@ export default function Home() {
           ): item is {
             record: Record<string, string>;
             raw: string;
-            parts: NonNullable<ReturnType<typeof dateParts>>;
+            parts: NonNullable<ReturnType<typeof parseCompletionDate>>;
           } => Boolean(item.parts),
         )
         .sort((a, b) => {
@@ -604,7 +547,6 @@ export default function Home() {
               (record) => record["Employee ID"] || `${record["First Name"]} ${record["Last Name"]}`,
             ),
           );
-          const periodTranscripts = periodRecords.map((record) => record["Transcript ID"]).filter(Boolean);
           return {
             periodKey,
             periodLabel: periodLabel(periodKey),
@@ -612,15 +554,14 @@ export default function Home() {
             dateFrom: items[0].raw,
             dateTo: items[items.length - 1].raw,
             employeeCount: periodEmployees.size,
-            duplicateCount: periodTranscripts.length - new Set(periodTranscripts).size,
+            duplicateCount: duplicateRecordCount(periodRecords),
           };
         });
 
       const first = dates[0];
       const last = dates[dates.length - 1];
       const employees = new Set(records.map((record) => record["Employee ID"] || `${record["First Name"]} ${record["Last Name"]}`));
-      const transcripts = records.map((record) => record["Transcript ID"]).filter(Boolean);
-      const duplicateCount = transcripts.length - new Set(transcripts).size;
+      const duplicateCount = duplicateRecordCount(records);
       const rangeLabel =
         periods.length === 1
           ? periods[0].periodLabel
@@ -644,6 +585,7 @@ export default function Home() {
 
   function handleFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
+    event.target.value = "";
     if (file) void prepareFile(file);
   }
 
@@ -682,54 +624,38 @@ export default function Home() {
   }
 
   async function importReport() {
-    if (!importPreview || !session || demoMode) return;
+    if (!importPreview || !session) return;
+    if (!supportsSafeBatchImport(backendVersion)) {
+      setError("Update and redeploy the Google Apps Script backend before importing this report.");
+      return;
+    }
     setBusy(true);
     setError("");
     setMessage("");
     try {
-      let importedRows = 0;
-      let duplicateRowsSkipped = 0;
-      const unchangedPeriods: string[] = [];
-
-      for (let index = 0; index < importPreview.periods.length; index += 1) {
-        const period = importPreview.periods[index];
-        setImportProgress(`Importing ${index + 1} of ${importPreview.periods.length}: ${period.periodLabel}`);
-        try {
-          const result = await callApi(apiUrl, {
-            action: "importReport",
-            session: session.token,
-            fileName: importPreview.fileName,
-            periodKey: period.periodKey,
-            records: period.records,
-            replaceExisting: true,
-          });
-          importedRows += Number(result.importedRows) || 0;
-          duplicateRowsSkipped += Number(result.duplicateRowsSkipped) || 0;
-        } catch (caught) {
-          const text = caught instanceof Error ? caught.message : "The report could not be imported.";
-          if (/same completion records|every completion.*already stored/i.test(text)) {
-            unchangedPeriods.push(period.periodLabel);
-            continue;
-          }
-          throw new Error(`${period.periodLabel}: ${text}`);
-        }
-      }
-
-      const latestPeriod = importPreview.periods[importPreview.periods.length - 1];
-      const dashboardResult = await callApi(apiUrl, {
-        action: "getDashboard",
+      setImportProgress(`Validating and importing ${formatNumber(importPreview.periods.length)} ${importPreview.periods.length === 1 ? "month" : "months"}…`);
+      const result = await callApi(apiUrl, {
+        action: "importReportBatch",
         session: session.token,
-        viewMode: "month",
-        period: latestPeriod.periodKey,
+        fileName: importPreview.fileName,
+        periods: importPreview.periods.map((period) => ({
+          periodKey: period.periodKey,
+          records: period.records,
+        })),
+        replaceExisting: true,
       });
+      const latestPeriod = importPreview.periods[importPreview.periods.length - 1];
       setUploadOpen(false);
       setImportPreview(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
       setViewMode("month");
       setSelectedPeriod(latestPeriod.periodKey);
-      setDashboard(dashboardResult.dashboard);
+      setDashboard(result.dashboard);
 
-      const importedMonthCount = importPreview.periods.length - unchangedPeriods.length;
+      const importedRows = Number(result.importedRows) || 0;
+      const duplicateRowsSkipped = Number(result.duplicateRowsSkipped) || 0;
+      const unchangedPeriods = Array.isArray(result.unchangedPeriods) ? result.unchangedPeriods : [];
+      const importedMonthCount = Number(result.importedMonthCount) || 0;
       const importedMessage = importedMonthCount
         ? `${formatNumber(importedRows)} records imported across ${formatNumber(importedMonthCount)} ${importedMonthCount === 1 ? "month" : "months"}.`
         : "Every month in this file is already uploaded.";
@@ -750,35 +676,6 @@ export default function Home() {
 
   async function openImportHistory() {
     if (!session) return;
-    if (demoMode) {
-      setImportHistory([
-        {
-          importId: "demo-current",
-          periodKey: "2026-06",
-          periodLabel: "June 2026",
-          fileName: "Monthly_Master_Completions_06_2026.csv",
-          importedAt: "Jul 28, 2026 2:12 PM",
-          importedBy: "Mlackey",
-          rowCount: 692,
-          activeRecordCount: 692,
-          status: "Active",
-        },
-        {
-          importId: "demo-duplicate",
-          periodKey: "2026-06",
-          periodLabel: "June 2026",
-          fileName: "Monthly_Master_Completions_06_2026.csv",
-          importedAt: "Jul 28, 2026 2:04 PM",
-          importedBy: "Mlackey",
-          rowCount: 692,
-          activeRecordCount: 692,
-          status: "Active",
-        },
-      ]);
-      setConfirmDeleteId("");
-      setImportsOpen(true);
-      return;
-    }
     setBusy(true);
     setError("");
     setMessage("");
@@ -799,17 +696,6 @@ export default function Home() {
 
   async function deleteImport(importId: string) {
     if (!session) return;
-    if (demoMode) {
-      setImportHistory((items) =>
-        items.map((item) =>
-          item.importId === importId ? { ...item, activeRecordCount: 0, status: "Deleted" } : item,
-        ),
-      );
-      setConfirmDeleteId("");
-      setSelectedImport(null);
-      setMessage("Preview only: the selected upload would be deleted.");
-      return;
-    }
     setBusy(true);
     setError("");
     setMessage("");
@@ -837,12 +723,6 @@ export default function Home() {
 
   async function openImportRecords(item: ImportHistoryItem) {
     if (!session || !item.activeRecordCount) return;
-    if (demoMode) {
-      setSelectedImport(item);
-      setImportRecords(DEMO_DATA.records);
-      setImportRecordSearch("");
-      return;
-    }
     setBusy(true);
     setError("");
     setMessage("");
@@ -862,15 +742,47 @@ export default function Home() {
     }
   }
 
+  async function openCategoryRecords(category: CategoryTotal) {
+    if (!session || !dashboard) return;
+    setSelectedCategory(category);
+    setSelectedCategoryRecords([]);
+    setRecordSearch("");
+    setError("");
+
+    if (!category.count) return;
+    if (dashboard.records.length) {
+      setSelectedCategoryRecords(
+        dashboard.records.filter((record) => record.categoryKey === category.key),
+      );
+      return;
+    }
+
+    setCategoryRecordsLoading(true);
+    try {
+      const result = await callApi(apiUrl, {
+        action: "getCategoryRecords",
+        session: session.token,
+        viewMode,
+        period: selectedPeriod,
+        categoryKey: category.key,
+      });
+      setSelectedCategoryRecords(result.records || []);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The completed records could not be loaded.");
+      setSelectedCategory(null);
+    } finally {
+      setCategoryRecordsLoading(false);
+    }
+  }
+
   const categoryRecords = useMemo(() => {
-    if (!selectedCategory || !dashboard) return [];
+    if (!selectedCategory) return [];
     const needle = recordSearch.trim().toLowerCase();
-    return dashboard.records.filter((record) => {
-      if (record.categoryKey !== selectedCategory.key) return false;
+    return selectedCategoryRecords.filter((record) => {
       if (!needle) return true;
       return Object.values(record).some((value) => String(value).toLowerCase().includes(needle));
     });
-  }, [dashboard, recordSearch, selectedCategory]);
+  }, [recordSearch, selectedCategory, selectedCategoryRecords]);
 
   const visibleImportRecords = useMemo(() => {
     const needle = importRecordSearch.trim().toLowerCase();
@@ -906,7 +818,6 @@ export default function Home() {
             <h2 id="login-title">Sign in</h2>
             <p>Use the username and password listed on the Google Sheet’s Users tab.</p>
 
-            {demoMode && <div className="notice info">Preview login: <strong>demo</strong> / <strong>demo</strong></div>}
             {error && <div className="notice error" role="alert">{error}</div>}
             {message && <div className="notice success">{message}</div>}
 
@@ -935,13 +846,11 @@ export default function Home() {
               </button>
             </form>
 
-            {!demoMode && (
-              <button className="text-button setup-link" type="button" onClick={() => setSetupOpen((open) => !open)}>
-                {setupOpen ? "Hide database setup" : "Database setup"}
-              </button>
-            )}
+            <button className="text-button setup-link" type="button" onClick={() => setSetupOpen((open) => !open)}>
+              {setupOpen ? "Hide database setup" : "Database setup"}
+            </button>
 
-            {setupOpen && !demoMode && (
+            {setupOpen && (
               <form className="setup-box" onSubmit={saveConnection}>
                 <label>
                   Apps Script web app URL
@@ -1054,14 +963,20 @@ export default function Home() {
           </div>
         </section>
 
-        {error && <div className="notice error dashboard-notice" role="alert">{error}</div>}
+        {error && !uploadOpen && !importsOpen && !selectedImport && !selectedCategory && (
+          <div className="notice error dashboard-notice" role="alert">{error}</div>
+        )}
         {message && <div className="notice success dashboard-notice">{message}</div>}
         {session.role === "admin" && backendStatus === "connected" && backendVersion && !supportsUploadManagement(backendVersion) && (
           <div className="notice warning dashboard-notice">
             Update and redeploy the Google Apps Script backend to enable Manage Uploads and full duplicate protection.
           </div>
         )}
-        {demoMode && <div className="demo-banner">Dashboard preview using the June 2026 sample report.</div>}
+        {session.role === "admin" && supportsUploadManagement(backendVersion) && !supportsSafeBatchImport(backendVersion) && (
+          <div className="notice warning dashboard-notice">
+            Update and redeploy the Google Apps Script backend before uploading another report. Existing dashboard data remains available.
+          </div>
+        )}
 
         <section className="summary-grid" aria-label="Summary totals">
           <article className="summary-card featured">
@@ -1120,10 +1035,7 @@ export default function Home() {
                   <button
                     className={`category-card ${category.key === "uncategorized" && category.count ? "warning" : ""}`}
                     key={category.key}
-                    onClick={() => {
-                      setSelectedCategory(category);
-                      setRecordSearch("");
-                    }}
+                    onClick={() => void openCategoryRecords(category)}
                   >
                     <span>{category.label}</span>
                     <div className="category-card-metrics">
@@ -1159,7 +1071,7 @@ export default function Home() {
 
       {uploadOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => !busy && setUploadOpen(false)}>
-          <section className="modal-card upload-modal" role="dialog" aria-modal="true" aria-labelledby="upload-title" onMouseDown={(event) => event.stopPropagation()}>
+          <section ref={uploadDialogRef} className="modal-card upload-modal" role="dialog" aria-modal="true" aria-labelledby="upload-title" onMouseDown={(event) => event.stopPropagation()}>
             <div className="modal-heading">
               <div>
                 <p className="eyebrow blue">Monthly report</p>
@@ -1168,8 +1080,8 @@ export default function Home() {
               <button className="close-button" onClick={() => setUploadOpen(false)} aria-label="Close">×</button>
             </div>
 
-            {demoMode && (
-              <div className="notice info">Preview mode can validate a report, but it will not save the file.</div>
+            {!supportsSafeBatchImport(backendVersion) && (
+              <div className="notice warning">Update and redeploy the Google Apps Script backend before importing. You can still inspect the file preview.</div>
             )}
             {error && <div className="notice error" role="alert">{error}</div>}
             <label
@@ -1220,11 +1132,13 @@ export default function Home() {
 
             <div className="modal-actions">
               <button className="secondary-button" onClick={() => setUploadOpen(false)} disabled={busy}>Cancel</button>
-              {!demoMode && (
-                <button className="primary-button" onClick={importReport} disabled={!importPreview || busy}>
-                  {busy ? importProgress || "Importing…" : "Import & Update Dashboard"}
-                </button>
-              )}
+              <button
+                className="primary-button"
+                onClick={importReport}
+                disabled={!importPreview || busy || !supportsSafeBatchImport(backendVersion)}
+              >
+                {busy ? importProgress || "Importing…" : "Import & Update Dashboard"}
+              </button>
             </div>
           </section>
         </div>
@@ -1232,7 +1146,7 @@ export default function Home() {
 
       {importsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => !busy && setImportsOpen(false)}>
-          <section className="modal-card imports-modal" role="dialog" aria-modal="true" aria-labelledby="imports-title" onMouseDown={(event) => event.stopPropagation()}>
+          <section ref={importsDialogRef} className="modal-card imports-modal" role="dialog" aria-modal="true" aria-labelledby="imports-title" onMouseDown={(event) => event.stopPropagation()}>
             <div className="modal-heading">
               <div>
                 <p className="eyebrow blue">Report administration</p>
@@ -1306,7 +1220,7 @@ export default function Home() {
 
       {selectedImport && (
         <div className="modal-backdrop detail-backdrop" role="presentation" onMouseDown={() => setSelectedImport(null)}>
-          <section className="modal-card records-modal" role="dialog" aria-modal="true" aria-labelledby="import-records-title" onMouseDown={(event) => event.stopPropagation()}>
+          <section ref={importRecordsDialogRef} className="modal-card records-modal" role="dialog" aria-modal="true" aria-labelledby="import-records-title" onMouseDown={(event) => event.stopPropagation()}>
             <div className="modal-heading">
               <div>
                 <p className="eyebrow blue">{selectedImport.periodLabel}</p>
@@ -1362,7 +1276,7 @@ export default function Home() {
 
       {selectedCategory && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setSelectedCategory(null)}>
-          <section className="modal-card records-modal" role="dialog" aria-modal="true" aria-labelledby="records-title" onMouseDown={(event) => event.stopPropagation()}>
+          <section ref={categoryRecordsDialogRef} className="modal-card records-modal" role="dialog" aria-modal="true" aria-labelledby="records-title" onMouseDown={(event) => event.stopPropagation()}>
             <div className="modal-heading">
               <div>
                 <p className="eyebrow blue">{dashboard?.periodLabel}</p>
@@ -1380,6 +1294,7 @@ export default function Home() {
               />
             </label>
             <div className="table-wrap">
+              {categoryRecordsLoading && <div className="notice info">Loading completed records…</div>}
               <table>
                 <thead>
                   <tr>
@@ -1400,7 +1315,7 @@ export default function Home() {
                       <td>{record.documentedHours ? formatHours(record.documentedHours) : "—"}</td>
                     </tr>
                   ))}
-                  {!categoryRecords.length && (
+                  {!categoryRecordsLoading && !categoryRecords.length && (
                     <tr><td className="empty-table" colSpan={5}>No matching records for this category and period.</td></tr>
                   )}
                 </tbody>
