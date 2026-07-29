@@ -22,7 +22,7 @@ test("mobile styles keep the user menu and sign-out control available", () => {
 test("uploads use protected batch imports and prevent browser file navigation", () => {
   assert.match(pageSource, /action:\s*"importReportBatch"/);
   assert.match(pageSource, /window\.addEventListener\("drop",\s*preventBrowserFileOpen\)/);
-  assert.match(appsScriptSource, /version:\s*"1\.2\.1"/);
+  assert.match(appsScriptSource, /version:\s*"1\.3\.0"/);
   assert.match(appsScriptSource, /function\s+replaceImportDataSafely_/);
   assert.match(pageSource, /minor === 2 && patch >= 1/);
 });
@@ -40,4 +40,13 @@ test("multi-month uploads import one month at a time and refresh the selected da
   assert.match(pageSource, /periods:\s*\[\{\s*periodKey:\s*period\.periodKey/);
   assert.match(pageSource, /await loadDashboard\("month", latestPeriod\.periodKey\)/);
   assert.match(pageSource, /finished and remain saved\. Check Manage Uploads before trying again\./);
+});
+
+test("dashboard supports an inclusive between-dates view", () => {
+  assert.match(pageSource, /<option value="range"[^>]*>Between Dates<\/option>/);
+  assert.match(pageSource, /type="date" value=\{rangeStart\}/);
+  assert.match(pageSource, /type="date" value=\{rangeEnd\}/);
+  assert.match(pageSource, /onClick=\{applyDateRange\}/);
+  assert.match(appsScriptSource, /\["month", "year", "range", "all"\]/);
+  assert.match(appsScriptSource, /completionDate >= dateRange\.startDate && completionDate <= dateRange\.endDate/);
 });
