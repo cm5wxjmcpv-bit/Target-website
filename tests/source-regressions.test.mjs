@@ -4,6 +4,7 @@ import test from "node:test";
 
 const pageSource = readFileSync(new URL("../app/page.tsx", import.meta.url), "utf8");
 const cssSource = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
+const configSource = readFileSync(new URL("../app/config.ts", import.meta.url), "utf8");
 const appsScriptSource = readFileSync(new URL("../apps-script/Code.gs", import.meta.url), "utf8");
 
 test("production source no longer contains public demo mode", () => {
@@ -49,4 +50,15 @@ test("dashboard supports an inclusive between-dates view", () => {
   assert.match(pageSource, /onClick=\{applyDateRange\}/);
   assert.match(appsScriptSource, /\["month", "year", "range", "all"\]/);
   assert.match(appsScriptSource, /completionDate >= dateRange\.startDate && completionDate <= dateRange\.endDate/);
+});
+
+test("frontend uses the current Apps Script deployment", () => {
+  assert.match(
+    configSource,
+    /AKfycbxxlAtOJJZKmV3eB9pXpycVlo26OMXutP8saC0a_-Gbz-chnx8Sx14hodPYzOI84O8r/,
+  );
+  assert.match(
+    configSource,
+    /legacyApiUrls:[\s\S]*AKfycbz6DjEd3WdowFVDk1fs8YZhHD-f1eR043QRlkkHNHbfHyPDEBFU3AIscICJdBI-YQ6C/,
+  );
 });
