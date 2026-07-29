@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { APP_CONFIG } from "./config";
 
 type ViewMode = "month" | "year" | "all";
@@ -66,10 +66,20 @@ type DashboardData = {
   } | null;
 };
 
+type ImportPeriodPreview = {
+  records: Record<string, string>[];
+  periodKey: string;
+  periodLabel: string;
+  dateFrom: string;
+  dateTo: string;
+  employeeCount: number;
+  duplicateCount: number;
+};
+
 type ImportPreview = {
   fileName: string;
   records: Record<string, string>[];
-  periodKey: string;
+  periods: ImportPeriodPreview[];
   periodLabel: string;
   dateFrom: string;
   dateTo: string;
@@ -313,10 +323,13 @@ export default function Home() {
   const [importRecords, setImportRecords] = useState<DashboardRecord[]>([]);
   const [importRecordSearch, setImportRecordSearch] = useState("");
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
+  const [importProgress, setImportProgress] = useState("");
+  const [isDragActive, setIsDragActive] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<CategoryTotal | null>(null);
   const [recordSearch, setRecordSearch] = useState("");
   const [demoMode, setDemoMode] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepthRef = useRef(0);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -371,6 +384,21 @@ export default function Home() {
     // The initial dashboard load is tied to a successful login/session restore.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session, demoMode]);
+
+  useEffect(() => {
+    if (!uploadOpen) return;
+
+    function preventBrowserFileOpen(event: globalThis.DragEvent) {
+      if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
+    }
+
+    window.addEventListener("dragover", preventBrowserFileOpen);
+    window.addEventListener("drop", preventBrowserFileOpen);
+    return () => {
+      window.removeEventListener("dragover", preventBrowserFileOpen);
+      window.removeEventListener("drop", preventBrowserFileOpen);
+    };
+  }, [uploadOpen]);
 
   async function checkBackend(url = apiUrl) {
     if (!url) {
@@ -506,12 +534,14 @@ export default function Home() {
     void loadDashboard(viewMode, nextPeriod);
   }
 
-  async function handleFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) return;
+  async function prepareFile(file: File) {
     setError("");
     setMessage("");
     try {
+      if (!file.name.toLowerCase().endsWith(".csv")) {
+        throw new Error("Choose the CSV version of the TargetSolutions report.");
+      }
+
       const text = await file.text();
       const rows = parseCsv(text);
       const headerIndex = rows.findIndex((row) => row[0] === "First Name" && row[1] === "Last Name");
@@ -528,9 +558,28 @@ export default function Home() {
         .map((row) => Object.fromEntries(headers.map((header, index) => [header, String(row[index] || "").trim()])));
       if (!records.length) throw new Error("The report does not contain any completion records.");
 
-      const dates = records
-        .map((record) => ({ raw: record["Completion Date"], parts: dateParts(record["Completion Date"]) }))
-        .filter((item): item is { raw: string; parts: NonNullable<ReturnType<typeof dateParts>> } => Boolean(item.parts))
+      const datedRecords = records.map((record) => ({
+        record,
+        raw: record["Completion Date"],
+        parts: dateParts(record["Completion Date"]),
+      }));
+      const invalidDateCount = datedRecords.filter((item) => !item.parts).length;
+      if (invalidDateCount) {
+        throw new Error(
+          `${formatNumber(invalidDateCount)} ${invalidDateCount === 1 ? "record has" : "records have"} an invalid completion date.`,
+        );
+      }
+
+      const dates = datedRecords
+        .filter(
+          (
+            item,
+          ): item is {
+            record: Record<string, string>;
+            raw: string;
+            parts: NonNullable<ReturnType<typeof dateParts>>;
+          } => Boolean(item.parts),
+        )
         .sort((a, b) => {
           const left = a.parts.year * 10000 + a.parts.month * 100 + a.parts.day;
           const right = b.parts.year * 10000 + b.parts.month * 100 + b.parts.day;
@@ -538,22 +587,50 @@ export default function Home() {
         });
       if (!dates.length) throw new Error("No valid completion dates were found.");
 
+      const periodGroups = new Map<string, typeof dates>();
+      dates.forEach((item) => {
+        const key = `${item.parts.year}-${String(item.parts.month).padStart(2, "0")}`;
+        const group = periodGroups.get(key) || [];
+        group.push(item);
+        periodGroups.set(key, group);
+      });
+
+      const periods = Array.from(periodGroups.entries())
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([periodKey, items]) => {
+          const periodRecords = items.map((item) => item.record);
+          const periodEmployees = new Set(
+            periodRecords.map(
+              (record) => record["Employee ID"] || `${record["First Name"]} ${record["Last Name"]}`,
+            ),
+          );
+          const periodTranscripts = periodRecords.map((record) => record["Transcript ID"]).filter(Boolean);
+          return {
+            periodKey,
+            periodLabel: periodLabel(periodKey),
+            records: periodRecords,
+            dateFrom: items[0].raw,
+            dateTo: items[items.length - 1].raw,
+            employeeCount: periodEmployees.size,
+            duplicateCount: periodTranscripts.length - new Set(periodTranscripts).size,
+          };
+        });
+
       const first = dates[0];
       const last = dates[dates.length - 1];
-      if (first.parts.year !== last.parts.year || first.parts.month !== last.parts.month) {
-        throw new Error("The uploaded file contains more than one completion month. Upload one monthly report at a time.");
-      }
-
-      const periodKey = `${first.parts.year}-${String(first.parts.month).padStart(2, "0")}`;
       const employees = new Set(records.map((record) => record["Employee ID"] || `${record["First Name"]} ${record["Last Name"]}`));
       const transcripts = records.map((record) => record["Transcript ID"]).filter(Boolean);
       const duplicateCount = transcripts.length - new Set(transcripts).size;
+      const rangeLabel =
+        periods.length === 1
+          ? periods[0].periodLabel
+          : `${periods[0].periodLabel}–${periods[periods.length - 1].periodLabel}`;
 
       setImportPreview({
         fileName: file.name,
         records,
-        periodKey,
-        periodLabel: periodLabel(periodKey),
+        periods,
+        periodLabel: rangeLabel,
         dateFrom: first.raw,
         dateTo: last.raw,
         employeeCount: employees.size,
@@ -565,33 +642,108 @@ export default function Home() {
     }
   }
 
+  function handleFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) void prepareFile(file);
+  }
+
+  function handleDragEnter(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current += 1;
+    setIsDragActive(true);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDragActive(false);
+  }
+
+  function handleDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = 0;
+    setIsDragActive(false);
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length !== 1) {
+      setImportPreview(null);
+      setError("Drop one TargetSolutions CSV file at a time.");
+      return;
+    }
+    void prepareFile(files[0]);
+  }
+
   async function importReport() {
     if (!importPreview || !session || demoMode) return;
     setBusy(true);
     setError("");
+    setMessage("");
     try {
-      const result = await callApi(apiUrl, {
-        action: "importReport",
+      let importedRows = 0;
+      let duplicateRowsSkipped = 0;
+      const unchangedPeriods: string[] = [];
+
+      for (let index = 0; index < importPreview.periods.length; index += 1) {
+        const period = importPreview.periods[index];
+        setImportProgress(`Importing ${index + 1} of ${importPreview.periods.length}: ${period.periodLabel}`);
+        try {
+          const result = await callApi(apiUrl, {
+            action: "importReport",
+            session: session.token,
+            fileName: importPreview.fileName,
+            periodKey: period.periodKey,
+            records: period.records,
+            replaceExisting: true,
+          });
+          importedRows += Number(result.importedRows) || 0;
+          duplicateRowsSkipped += Number(result.duplicateRowsSkipped) || 0;
+        } catch (caught) {
+          const text = caught instanceof Error ? caught.message : "The report could not be imported.";
+          if (/same completion records|every completion.*already stored/i.test(text)) {
+            unchangedPeriods.push(period.periodLabel);
+            continue;
+          }
+          throw new Error(`${period.periodLabel}: ${text}`);
+        }
+      }
+
+      const latestPeriod = importPreview.periods[importPreview.periods.length - 1];
+      const dashboardResult = await callApi(apiUrl, {
+        action: "getDashboard",
         session: session.token,
-        fileName: importPreview.fileName,
-        periodKey: importPreview.periodKey,
-        records: importPreview.records,
-        replaceExisting: true,
+        viewMode: "month",
+        period: latestPeriod.periodKey,
       });
       setUploadOpen(false);
       setImportPreview(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
       setViewMode("month");
-      setSelectedPeriod(importPreview.periodKey);
-      setDashboard(result.dashboard);
-      const skipped = Number(result.duplicateRowsSkipped) || 0;
-      setMessage(
-        `${formatNumber(result.importedRows)} records imported for ${importPreview.periodLabel}.` +
-        (skipped ? ` ${formatNumber(skipped)} duplicate ${skipped === 1 ? "record was" : "records were"} skipped.` : ""),
-      );
+      setSelectedPeriod(latestPeriod.periodKey);
+      setDashboard(dashboardResult.dashboard);
+
+      const importedMonthCount = importPreview.periods.length - unchangedPeriods.length;
+      const importedMessage = importedMonthCount
+        ? `${formatNumber(importedRows)} records imported across ${formatNumber(importedMonthCount)} ${importedMonthCount === 1 ? "month" : "months"}.`
+        : "Every month in this file is already uploaded.";
+      const unchangedMessage = unchangedPeriods.length
+        ? ` ${formatNumber(unchangedPeriods.length)} unchanged ${unchangedPeriods.length === 1 ? "month was" : "months were"} skipped.`
+        : "";
+      const duplicateMessage = duplicateRowsSkipped
+        ? ` ${formatNumber(duplicateRowsSkipped)} duplicate ${duplicateRowsSkipped === 1 ? "record was" : "records were"} skipped.`
+        : "";
+      setMessage(importedMessage + unchangedMessage + duplicateMessage);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The report could not be imported.");
     } finally {
+      setImportProgress("");
       setBusy(false);
     }
   }
@@ -847,7 +999,15 @@ export default function Home() {
               >
                 Manage Uploads
               </button>
-              <button className="upload-button" onClick={() => setUploadOpen(true)}>
+              <button
+                className="upload-button"
+                onClick={() => {
+                  setError("");
+                  setMessage("");
+                  setImportPreview(null);
+                  setUploadOpen(true);
+                }}
+              >
                 <span aria-hidden="true">↑</span> Upload Report
               </button>
             </div>
@@ -1011,11 +1171,18 @@ export default function Home() {
             {demoMode && (
               <div className="notice info">Preview mode can validate a report, but it will not save the file.</div>
             )}
-            <label className="file-drop">
+            {error && <div className="notice error" role="alert">{error}</div>}
+            <label
+              className={`file-drop ${isDragActive ? "drag-active" : ""}`}
+              onDragEnter={handleDragEnter}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+            >
               <input ref={fileInputRef} type="file" accept=".csv,text/csv" onChange={handleFile} />
               <span className="file-icon">CSV</span>
-              <strong>Select the Monthly Master Completions file</strong>
-              <small>The report will be checked before anything is saved.</small>
+              <strong>{isDragActive ? "Drop the report here" : "Choose a file or drag it here"}</strong>
+              <small>Monthly and multi-month TargetSolutions CSV reports are supported.</small>
             </label>
 
             {importPreview && (
@@ -1029,15 +1196,25 @@ export default function Home() {
                 </div>
                 <div className="preview-grid">
                   <div><span>Records</span><strong>{formatNumber(importPreview.records.length)}</strong></div>
+                  <div><span>Months</span><strong>{formatNumber(importPreview.periods.length)}</strong></div>
                   <div><span>Employees</span><strong>{formatNumber(importPreview.employeeCount)}</strong></div>
                   <div><span>Date range</span><strong>{importPreview.dateFrom}–{importPreview.dateTo}</strong></div>
                   <div><span>Duplicates in file</span><strong>{formatNumber(importPreview.duplicateCount)}</strong></div>
                 </div>
-                {dashboard?.periods.includes(importPreview.periodKey) && (
+                <div className="import-period-list" aria-label="Months included in this file">
+                  {importPreview.periods.map((period) => (
+                    <span key={period.periodKey}>
+                      {period.periodLabel}
+                      <strong>{formatNumber(period.records.length)} records</strong>
+                    </span>
+                  ))}
+                </div>
+                {importPreview.periods.some((period) => dashboard?.periods.includes(period.periodKey)) && (
                   <div className="notice warning">
-                    {importPreview.periodLabel} was previously uploaded. Continuing will replace that month and prevent duplicate totals.
+                    Previously uploaded months will be replaced safely. Months with identical records will be skipped.
                   </div>
                 )}
+                {importProgress && <div className="notice info">{importProgress}</div>}
               </div>
             )}
 
@@ -1045,7 +1222,7 @@ export default function Home() {
               <button className="secondary-button" onClick={() => setUploadOpen(false)} disabled={busy}>Cancel</button>
               {!demoMode && (
                 <button className="primary-button" onClick={importReport} disabled={!importPreview || busy}>
-                  {busy ? "Importing…" : "Import & Update Dashboard"}
+                  {busy ? importProgress || "Importing…" : "Import & Update Dashboard"}
                 </button>
               )}
             </div>
