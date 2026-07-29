@@ -11,7 +11,7 @@ import {
   periodLabel,
 } from "./report-utils";
 
-type ViewMode = "month" | "year" | "all";
+type ViewMode = "month" | "year" | "range" | "all";
 
 type UserSession = {
   token: string;
@@ -48,6 +48,8 @@ type DashboardData = {
   selectedPeriod: string;
   periodLabel: string;
   viewMode: ViewMode;
+  rangeStart?: string;
+  rangeEnd?: string;
   periods: string[];
   years: string[];
   totals: {
@@ -174,6 +176,22 @@ function supportsSafeBatchImport(version: string) {
   return major > 1 || (major === 1 && (minor > 2 || (minor === 2 && patch >= 1)));
 }
 
+function supportsDateRange(version: string) {
+  const parts = String(version || "").split(".").map(Number);
+  const major = parts[0] || 0;
+  const minor = parts[1] || 0;
+  return major > 1 || (major === 1 && minor >= 3);
+}
+
+function lastDateOfMonth(period: string) {
+  const match = String(period || "").match(/^(\d{4})-(\d{2})$/);
+  if (!match) return "";
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return `${match[1]}-${match[2]}-${String(day).padStart(2, "0")}`;
+}
+
 async function callApi(apiUrl: string, payload: Record<string, unknown>) {
   const response = await fetch(apiUrl, {
     method: "POST",
@@ -196,6 +214,8 @@ export default function Home() {
   const [loginPassword, setLoginPassword] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("month");
   const [selectedPeriod, setSelectedPeriod] = useState("");
+  const [rangeStart, setRangeStart] = useState("");
+  const [rangeEnd, setRangeEnd] = useState("");
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -433,7 +453,12 @@ export default function Home() {
     setLoginPassword("");
   }
 
-  async function loadDashboard(mode: ViewMode, period: string) {
+  async function loadDashboard(
+    mode: ViewMode,
+    period: string,
+    startDate = rangeStart,
+    endDate = rangeEnd,
+  ) {
     if (!session) return;
     const requestId = dashboardRequestRef.current + 1;
     dashboardRequestRef.current = requestId;
@@ -445,6 +470,8 @@ export default function Home() {
         session: session.token,
         viewMode: mode,
         period,
+        startDate,
+        endDate,
         includeRecords: false,
       });
       if (requestId !== dashboardRequestRef.current) return;
@@ -461,6 +488,21 @@ export default function Home() {
   }
 
   function changeViewMode(nextMode: ViewMode) {
+    if (nextMode === "range") {
+      if (!supportsDateRange(backendVersion)) {
+        setError("Update and redeploy the Google Apps Script backend to enable Between Dates.");
+        return;
+      }
+      const latestMonth = dashboard?.periods[0] || "";
+      const nextStart = rangeStart || (latestMonth ? `${latestMonth.slice(0, 4)}-01-01` : "");
+      const nextEnd = rangeEnd || lastDateOfMonth(latestMonth);
+      setViewMode(nextMode);
+      setRangeStart(nextStart);
+      setRangeEnd(nextEnd);
+      setSelectedPeriod(`${nextStart}|${nextEnd}`);
+      if (nextStart && nextEnd) void loadDashboard(nextMode, `${nextStart}|${nextEnd}`, nextStart, nextEnd);
+      return;
+    }
     setViewMode(nextMode);
     const nextPeriod =
       nextMode === "month"
@@ -475,6 +517,20 @@ export default function Home() {
   function changePeriod(nextPeriod: string) {
     setSelectedPeriod(nextPeriod);
     void loadDashboard(viewMode, nextPeriod);
+  }
+
+  function applyDateRange() {
+    if (!rangeStart || !rangeEnd) {
+      setError("Choose both a start date and an end date.");
+      return;
+    }
+    if (rangeStart > rangeEnd) {
+      setError("The start date must be on or before the end date.");
+      return;
+    }
+    const nextPeriod = `${rangeStart}|${rangeEnd}`;
+    setSelectedPeriod(nextPeriod);
+    void loadDashboard("range", nextPeriod, rangeStart, rangeEnd);
   }
 
   async function prepareFile(file: File) {
@@ -730,6 +786,8 @@ export default function Home() {
         importId,
         viewMode,
         period: selectedPeriod,
+        startDate: rangeStart,
+        endDate: rangeEnd,
       });
       setImportHistory(result.imports || []);
       setDashboard(result.dashboard);
@@ -788,6 +846,8 @@ export default function Home() {
         session: session.token,
         viewMode,
         period: selectedPeriod,
+        startDate: rangeStart,
+        endDate: rangeEnd,
         categoryKey: category.key,
       });
       setSelectedCategoryRecords(result.records || []);
@@ -969,10 +1029,11 @@ export default function Home() {
               <select value={viewMode} onChange={(event) => changeViewMode(event.target.value as ViewMode)}>
                 <option value="month">Month</option>
                 <option value="year">Year</option>
+                <option value="range" disabled={!supportsDateRange(backendVersion)}>Between Dates</option>
                 <option value="all">All Time</option>
               </select>
             </label>
-            {viewMode !== "all" && (
+            {viewMode !== "all" && viewMode !== "range" && (
               <label>
                 Period
                 <select value={selectedPeriod} onChange={(event) => changePeriod(event.target.value)}>
@@ -983,6 +1044,26 @@ export default function Home() {
                   ))}
                 </select>
               </label>
+            )}
+            {viewMode === "range" && (
+              <>
+                <label>
+                  Start date
+                  <input type="date" value={rangeStart} onChange={(event) => setRangeStart(event.target.value)} />
+                </label>
+                <label>
+                  End date
+                  <input type="date" value={rangeEnd} onChange={(event) => setRangeEnd(event.target.value)} />
+                </label>
+                <button
+                  className="range-apply-button"
+                  type="button"
+                  onClick={applyDateRange}
+                  disabled={busy || !rangeStart || !rangeEnd}
+                >
+                  Apply
+                </button>
+              </>
             )}
           </div>
         </section>
@@ -999,6 +1080,11 @@ export default function Home() {
         {session.role === "admin" && supportsUploadManagement(backendVersion) && !supportsSafeBatchImport(backendVersion) && (
           <div className="notice warning dashboard-notice">
             Update and redeploy the Google Apps Script backend before uploading another report. Existing dashboard data remains available.
+          </div>
+        )}
+        {backendStatus === "connected" && backendVersion && !supportsDateRange(backendVersion) && (
+          <div className="notice warning dashboard-notice">
+            Update and redeploy the Google Apps Script backend to enable the Between Dates view.
           </div>
         )}
 
