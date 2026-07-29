@@ -31,3 +31,13 @@ test("batch imports can append prepared rows without reassigning a constant", ()
   assert.match(appsScriptSource, /let\s+nextCompletionRows\s*=\s*retainedRows\.slice\(\)/);
   assert.doesNotMatch(appsScriptSource, /const\s+nextCompletionRows\s*=\s*retainedRows\.slice\(\)/);
 });
+
+test("multi-month uploads import one month at a time and refresh the selected dashboard", () => {
+  assert.match(
+    pageSource,
+    /for\s*\(let index = 0; index < preview\.periods\.length; index \+= 1\)/,
+  );
+  assert.match(pageSource, /periods:\s*\[\{\s*periodKey:\s*period\.periodKey/);
+  assert.match(pageSource, /await loadDashboard\("month", latestPeriod\.periodKey\)/);
+  assert.match(pageSource, /finished and remain saved\. Check Manage Uploads before trying again\./);
+});
