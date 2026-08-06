@@ -7,7 +7,8 @@ A professional, simple monthly completion dashboard for Martinsville Fire & EMS.
 - Signs users in from the Google Sheet `Users` tab
 - Imports TargetSolutions `Monthly Master Completions` CSV files
 - Blocks repeat completion records and exact duplicate reports
-- Detects and replaces previously uploaded months when the report has changed
+- Validates and commits every month in a multi-month report as one protected batch
+- Detects and safely replaces previously uploaded months when the report has changed
 - Lets administrators review, search, and delete uploaded report batches
 - Displays monthly, yearly, and all-time totals
 - Keeps every required dashboard area visible, including zero totals
@@ -31,6 +32,17 @@ Change that password on the `Users` sheet before sharing the dashboard.
 
 Open the login page, select **Database setup**, paste the deployed Google Apps Script `/exec` URL, and click **Connect**. The connection is saved only in that browser.
 
+## Hosting
+
+The production frontend is published to GitHub Pages from the `main` branch by
+the workflow in `.github/workflows/deploy-pages.yml`. The GitHub Pages build is
+a static export; all application data and login operations continue to use the
+Google Apps Script web app and Google Sheet described above.
+
+The existing Sites build remains available as a rollback target. The GitHub
+Pages configuration is enabled only by `npm run build:pages`, so it does not
+alter the existing Sites build.
+
 ## Design notes
 
 The site is intentionally focused:
@@ -49,4 +61,8 @@ npm install
 npm run dev
 ```
 
-To view the sample June 2026 dashboard without a backend, open the site with `?demo=1` and sign in using `demo` / `demo`.
+To verify the GitHub Pages artifact locally:
+
+```bash
+npm run build:pages
+```
